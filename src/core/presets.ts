@@ -1,7 +1,9 @@
 import { defaultBody, defaultHead, defaultManhole, defaultSensor, emptyProject } from './defaults';
+import { defaultPit } from './pit';
+import { rectangle } from './polygon';
 import type { HeadConfig, Project, SensorConfig, SensorKind } from './types';
 
-export type PresetGroup = 'Vertical tanks' | 'Horizontal tanks' | 'Box and special shapes';
+export type PresetGroup = 'Vertical tanks' | 'Horizontal tanks' | 'Box and special shapes' | 'Concrete storages';
 
 export interface Preset {
   id: string;
@@ -499,9 +501,71 @@ export const PRESETS: Preset[] = [
       return p;
     },
   },
+  {
+    id: 'asphalt-storage',
+    group: 'Concrete storages',
+    label: 'Asphalt storage · sloped floor · 1,476 m³',
+    description: 'Open concrete storage, 20 × 17.8 m in plan, walls 4 m above the shallow end, floor dropping 300 mm toward the outlet wall. TEK 766 on a 250 mm bracket on the wall top.',
+    build() {
+      const p = emptyProject();
+      p.name = 'Asphalt storage 7';
+      p.units = { ...p.units, volume: 'm3' };
+      p.tank = {
+        ...p.tank,
+        kind: 'pit',
+        pit: {
+          ...defaultPit(),
+          outline: rectangle(20000, 17789),
+          wallHeight: 4000,
+          heightRef: 'floorHigh',
+          floor: { type: 'plane', direction: 180, drop: 300 },
+          wallTop: 300,
+          wallBase: 500,
+          slab: 300,
+          operationLevel: 3800,
+          checks: [
+            { level: 0, litres: 53367 },
+            { level: 3800, litres: 1405331 },
+            { level: 4000, litres: 1476487 },
+          ],
+        },
+      };
+      p.liquid = { preset: 'custom', density: 1030 };
+      p.sensors = [sensor('ultrasonic', 'LT-101', { x: -8500, y: 0, nozzle: 250, deadBand: 220, maxRange: 4000, beamAngle: 10, resolution: 10 })];
+      return p;
+    },
+  },
+  {
+    id: 'basin-sump',
+    group: 'Concrete storages',
+    label: 'Rectangular basin · flat floor · sump',
+    description: '12 × 8 m basin, 2.5 m walls, flat floor with a 1 × 1 m sump 400 mm deep at the outlet corner. Radar on the wall top.',
+    build() {
+      const p = emptyProject();
+      p.name = 'Collection basin';
+      p.units = { ...p.units, volume: 'm3' };
+      p.tank = {
+        ...p.tank,
+        kind: 'pit',
+        pit: {
+          ...defaultPit(),
+          outline: rectangle(12000, 8000),
+          wallHeight: 2500,
+          heightRef: 'floorLow',
+          floor: { type: 'flat' },
+          sumps: [{ x: 5000, y: -3000, width: 1000, length: 1000, depth: 400 }],
+          wallTop: 250,
+          wallBase: 350,
+          slab: 250,
+        },
+      };
+      p.sensors = [sensor('radar', 'LT-101', { x: 4000, y: -2000, nozzle: 200, rangeMin: 0, rangeMax: 4000, maxRange: 8000 })];
+      return p;
+    },
+  },
 ];
 
-export const PRESET_GROUPS: PresetGroup[] = ['Vertical tanks', 'Horizontal tanks', 'Box and special shapes'];
+export const PRESET_GROUPS: PresetGroup[] = ['Vertical tanks', 'Horizontal tanks', 'Box and special shapes', 'Concrete storages'];
 
 export function defaultProject(): Project {
   return PRESETS[0].build();

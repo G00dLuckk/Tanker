@@ -1,7 +1,9 @@
 import { sensorColor, token } from '../app/colors';
 import { SENSOR_KINDS } from '../core/defaults';
+import type { PitModel } from '../core/pit';
+import { centroid, offset } from '../core/polygon';
 import { makeOutline } from '../core/shape';
-import { manholeClearance, manholeEdge, verticalSpan } from '../core/sensors';
+import { manholeClearance, manholeEdge } from '../core/sensors';
 import type { Sec } from '../core/tank';
 import { fmtLen, niceStep } from '../core/units';
 import { h } from './dom';
@@ -51,7 +53,13 @@ export class PlanView {
 
   /** Plan extents (mm): [xmin, xmax, ymin, ymax]. */
   private extents(): [number, number, number, number] {
-    const m = this.ctx.derived().model;
+    const d = this.ctx.derived();
+    if (d.kind === 'pit') {
+      const b = d.pit.box;
+      const grow = Math.max(0, d.pit.cfg.wallTop) + d.pit.batterK * d.pit.wallTop;
+      return [b.x0 - grow, b.x1 + grow, b.y0 - grow, b.y1 + grow];
+    }
+    const m = d.model;
     const w = m.base.A * m.maxScale + m.t.shell;
     if (m.orientation === 'vertical') {
       const d = m.base.B * m.maxScale + m.t.shell;
@@ -123,7 +131,9 @@ export class PlanView {
     // Tank outline.
     const sec: Sec = { ku: 0, kv: 0, cu: 0, cv: 0 };
     g.lineJoin = 'round';
-    if (m.orientation === 'vertical') {
+    if (d.kind === 'pit') {
+      this.drawPit(g, d.pit, { ink, ink3, line, water, surface, font });
+    } else if (m.orientation === 'vertical') {
       const o = makeOutline(m.base, 96);
       const ring = (scaleU: number, scaleV: number, cu = 0, cv = 0, grow = 0) => {
         g.beginPath();
@@ -303,6 +313,80 @@ export class PlanView {
     }
   }
 
+  /** A concrete storage: the walls, the inner outline, the floor slope and the sumps. */
+  private drawPit(g: CanvasRenderingContext2D, pit: PitModel, c: { ink: string; ink3: string; line: string; water: string; surface: string; font: string }) {
+    const path = (pts: { x: number; y: number }[]) => {
+      g.beginPath();
+      pts.forEach((q, i) => {
+        const [px, py] = this.toPx(q.x, q.y);
+        if (i === 0) g.moveTo(px, py);
+        else g.lineTo(px, py);
+      });
+      g.closePath();
+    };
+    // Concrete wall: the outer face (wall top width) filled, then the inner outline.
+    const wall = Math.max(0, pit.cfg.wallTop);
+    path(offset(pit.outline, wall + pit.batterK * pit.wallTop));
+    g.fillStyle = withAlpha(c.ink3, 0.22);
+    g.fill();
+    g.strokeStyle = c.ink;
+    g.lineWidth = 1.5;
+    g.stroke();
+    path(pit.outline);
+    g.fillStyle = withAlpha(c.water, 0.1);
+    g.fill();
+    g.strokeStyle = c.ink;
+    g.lineWidth = 1.25;
+    g.stroke();
+    // Sumps.
+    for (const s of pit.sumps) {
+      path(s.outline);
+      g.fillStyle = withAlpha(c.water, 0.22);
+      g.fill();
+      g.strokeStyle = c.ink3;
+      g.lineWidth = 1;
+      g.setLineDash([3, 3]);
+      g.stroke();
+      g.setLineDash([]);
+    }
+    // Floor: an arrow from the low side to the high side of a sloping floor, or the corner heights.
+    g.fillStyle = c.ink3;
+    g.font = c.font;
+    const f = pit.cfg.floor;
+    const u = this.ctx.store.project.units.length;
+    const lab = (v: number) => fmtLen(v, u, true, u === 'mm' ? 0 : undefined);
+    if (f.type === 'plane' && f.drop > 0) {
+      const th = (f.direction * Math.PI) / 180;
+      const cen = centroid(pit.outline);
+      const len = 0.28 * Math.min(pit.box.x1 - pit.box.x0, pit.box.y1 - pit.box.y0);
+      const a = { x: cen.x - Math.cos(th) * len, y: cen.y - Math.sin(th) * len };
+      const b = { x: cen.x + Math.cos(th) * len, y: cen.y + Math.sin(th) * len };
+      const [ax, ay] = this.toPx(a.x, a.y);
+      const [bx, by] = this.toPx(b.x, b.y);
+      g.strokeStyle = c.ink3;
+      g.lineWidth = 1.25;
+      g.beginPath();
+      g.moveTo(ax, ay);
+      g.lineTo(bx, by);
+      const ang = Math.atan2(by - ay, bx - ax);
+      g.moveTo(bx, by);
+      g.lineTo(bx - 8 * Math.cos(ang - 0.45), by - 8 * Math.sin(ang - 0.45));
+      g.moveTo(bx, by);
+      g.lineTo(bx - 8 * Math.cos(ang + 0.45), by - 8 * Math.sin(ang + 0.45));
+      g.stroke();
+      g.textAlign = 'center';
+      g.fillText(`floor rises ${lab(f.drop)}`, (ax + bx) / 2, Math.min(ay, by) - 6);
+      g.fillText('low', ax, ay + 12);
+      g.fillText('high', bx, by + 12);
+    } else if (f.type === 'vertices') {
+      g.textAlign = 'center';
+      pit.outline.forEach((q, i) => {
+        const [px, py] = this.toPx(q.x, q.y);
+        g.fillText(lab(pit.vertexZ[i]), px, py - 5);
+      });
+    }
+  }
+
   private hit(px: number, py: number): { id: string; kind: 'sensor' | 'manhole' } | null {
     const d = this.ctx.derived();
     let best: string | null = null;
@@ -348,25 +432,27 @@ export class PlanView {
       return;
     }
     this.canvas.style.cursor = 'grabbing';
-    const m = this.ctx.derived().model;
+    const d = this.ctx.derived();
+    const hull = d.hull;
     let [x, y] = this.toPlan(px, py);
     x += this.drag.dx;
     y += this.drag.dy;
-    const snap = niceStep(m.size / 300);
+    const snap = niceStep(hull.size / 300);
     x = Math.round(x / snap) * snap;
     y = Math.round(y / snap) * snap;
-    if (!verticalSpan(m, x, y)) {
-      // Pull the point back toward the plan origin (always inside the tank) until it fits.
+    if (!hull.span(x, y)) {
+      // Pull the point back toward a point inside (the plan origin, or the middle of a storage) until it fits.
+      const c = d.kind === 'pit' ? centroid(d.pit.outline) : { x: 0, y: 0 };
       let lo = 0;
       let hi = 1;
       for (let i = 0; i < 24; i++) {
         const t = (lo + hi) / 2;
-        if (verticalSpan(m, x * t, y * t)) lo = t;
+        if (hull.span(c.x + (x - c.x) * t, c.y + (y - c.y) * t)) lo = t;
         else hi = t;
       }
-      x = Math.trunc((x * lo) / snap) * snap;
-      y = Math.trunc((y * lo) / snap) * snap;
-      if (!verticalSpan(m, x, y)) return;
+      x = Math.round((c.x + (x - c.x) * lo) / snap) * snap;
+      y = Math.round((c.y + (y - c.y) * lo) / snap) * snap;
+      if (!hull.span(x, y)) return;
     }
     const { id, kind } = this.drag;
     this.ctx.store.update('sensors', (s) => {

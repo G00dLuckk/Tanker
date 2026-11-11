@@ -1,0 +1,4 @@
+{
+  "type": "commonjs",
+  "description": "The Cloud Studio test harnesses are plain CommonJS scripts (run with node), unlike the ES-module app around them."
+}

@@ -134,6 +134,8 @@ export interface ProfilePoint {
 }
 
 export interface TankConfig {
+  /** A closed tank (shell with two ends, the default) or an open concrete storage (pit) designed in plan. */
+  kind?: 'tank' | 'pit';
   orientation: Orientation;
   /** Whether the entered dimensions are outside or inside measurements. */
   basis: 'outside' | 'inside';
@@ -148,6 +150,81 @@ export interface TankConfig {
   sameEnds?: boolean;
   /** Manholes (hole doors) on the roof; top sensors can sit on their covers. */
   manholes?: ManholeConfig[];
+  /** The concrete storage when kind = 'pit'. */
+  pit?: PitConfig;
+}
+
+/** A point in the plan (mm). X runs left–right, Y front–back, like the sensor positions. */
+export interface PlanPoint {
+  x: number;
+  y: number;
+}
+
+/**
+ * How the floor of a concrete storage runs:
+ * - flat: level everywhere
+ * - plane: one slope, rising along `direction` (deg in the plan, 0 = +X, 90 = +Y) by `drop` mm
+ *   from the lowest edge of the outline to the highest
+ * - vertices: the floor height is given at every vertex of the outline and interpolated
+ *   across it (several slopes, a ridge, a stepped floor drawn with extra vertices)
+ */
+export type PitFloor =
+  | { type: 'flat' }
+  | { type: 'plane'; direction: number; drop: number }
+  | { type: 'vertices'; heights: number[] };
+
+/** A sump: a rectangular (or polygonal) pit in the floor, `depth` mm below the floor around it. */
+export interface PitSump {
+  x: number;
+  y: number;
+  /** Size along X (mm). */
+  width: number;
+  /** Size along Y (mm). */
+  length: number;
+  depth: number;
+  /** A polygonal sump: its outline replaces the rectangle. */
+  outline?: PlanPoint[];
+}
+
+/** A capacity from the engineer's drawing at a level (above the drawing's own zero), to check the design against. */
+export interface PitCheck {
+  level: number;
+  litres: number;
+}
+
+/**
+ * Where the heights on the drawing are measured from:
+ * - datum: the deepest point of the floor, sumps included (level zero of the scripts)
+ * - floorLow: the lowest point of the main floor (a sump may be deeper)
+ * - floorHigh: the highest point of the floor, the shallow end
+ */
+export type PitHeightRef = 'datum' | 'floorLow' | 'floorHigh';
+
+/**
+ * An open concrete storage (asphalt pit, basin, bund): the plan outline of the inner wall
+ * faces, the wall height and how the floor slopes. Level zero is the deepest point of the
+ * floor; the volume is worked out numerically over the plan.
+ */
+export interface PitConfig {
+  /** Plan outline of the inner wall faces: any simple polygon, vertices in order (mm). */
+  outline: PlanPoint[];
+  /** Top of the wall above `heightRef` (mm). */
+  wallHeight: number;
+  heightRef: PitHeightRef;
+  floor: PitFloor;
+  sumps: PitSump[];
+  /** Wall batter: the inner face leans outward by this many mm per metre of height. 0 = vertical. */
+  batter: number;
+  /** Wall top width, wall base width and floor slab thickness (mm): drawing only, never in the volume. */
+  wallTop: number;
+  wallBase: number;
+  slab: number;
+  /** Operation level and alarm levels above `heightRef` (mm), for information. */
+  operationLevel: number | null;
+  alarmHigh: number | null;
+  alarmLow: number | null;
+  /** Capacities from the drawing (level above `heightRef`) the design is checked against. */
+  checks: PitCheck[];
 }
 
 /**

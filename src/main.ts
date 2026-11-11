@@ -140,10 +140,11 @@ class App {
       'section',
       { class: 'card card-cta' },
       h('div', { class: 'card-label' }, 'For your platform'),
-      h('p', null, 'The configuration and payload scripts for every tank and sensor on the site, and the level-to-volume table of this tank.'),
+      h('p', null, 'The configuration and payload scripts for every tank and sensor on the site, the level-to-volume table of this tank, and the details of every tank for an AI assistant.'),
       h('button', { type: 'button', class: 'btn btn-primary btn-block', on: { click: () => this.exportDlg.open('config') } }, icon('doc', 17), 'Configuration'),
       h('button', { type: 'button', class: 'btn btn-block', on: { click: () => this.exportDlg.open('payload') } }, icon('doc', 17), 'Payload'),
       h('button', { type: 'button', class: 'btn btn-block', on: { click: () => this.exportDlg.open('table') } }, icon('doc', 17), 'Table'),
+      h('button', { type: 'button', class: 'btn btn-block', title: 'Shape, sizes and sensors of every tank, to give to an AI assistant', on: { click: () => this.exportDlg.open('details') } }, icon('doc', 17), 'Details'),
     );
     const live = h('aside', { class: 'panel panel-live', 'aria-label': 'Readings' }, h('div', { class: 'panel-scroll' }, this.readouts.el, this.chart.el, exportCard));
 

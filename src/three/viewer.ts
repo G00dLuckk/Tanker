@@ -7,7 +7,13 @@ import { manholeHalf, planToTank, type ManholeGeom, type Reading, type SensorGeo
 import { contains } from '../core/shape';
 import type { ViewState } from '../core/types';
 import { fmtLen, type LengthUnit } from '../core/units';
+import { buildPitGeometry, buildPitSurface } from './pitGeometry';
 import { buildSurface, buildTankGeometry, tankToLocal, type TankGeometry } from './tankGeometry';
+
+/** Render geometry of a tank or a concrete storage. */
+function geometryOf(d: Derived, segments?: number): TankGeometry {
+  return d.kind === 'pit' ? buildPitGeometry(d.pit) : buildTankGeometry(d.model, segments);
+}
 
 export interface SensorVisual {
   geom: SensorGeom;
@@ -275,7 +281,7 @@ export class TankViewer {
     this.nameTag = null;
 
     const m = d.model;
-    const geo = buildTankGeometry(m);
+    const geo = geometryOf(d);
     this.geo = geo;
 
     // Orientation and tilt: rotate about world Z, then sit the tank on its supports.
@@ -482,7 +488,7 @@ export class TankViewer {
 
   private buildNeighbour(t: SiteTank, index: number): Neighbour {
     const m = t.d.model;
-    const geo = buildTankGeometry(m, 64);
+    const geo = geometryOf(t.d, 64);
     const group = new THREE.Group();
     group.scale.setScalar(MM);
     group.rotation.set(0, 0, m.orientation === 'vertical' ? (-t.d.tilt * Math.PI) / 180 : (t.d.tilt * Math.PI) / 180);
@@ -602,6 +608,7 @@ export class TankViewer {
 
   private clearance(d: Derived): number {
     const m = d.model;
+    if (d.kind === 'pit') return 0;
     if (m.orientation === 'horizontal') return Math.max(120, 0.14 * m.outer.depth);
     if (m.bodyType === 'sphere') return Math.max(150, 0.12 * m.outer.width);
     if (m.start.type === 'flat') return 0;
@@ -929,7 +936,14 @@ export class TankViewer {
     };
     const u = this.unit;
     const f = (mm: number) => fmtLen(mm, u, true, u === 'mm' ? 0 : undefined);
-    if (m.orientation === 'vertical') {
+    if (this.d.kind === 'pit') {
+      // Inside sizes of the storage: wall height above the deepest point, and the plan box.
+      const pit = this.d.pit;
+      const x = box.min.x - gap;
+      dim(new THREE.Vector3(x, 0, z), new THREE.Vector3(x, pit.wallTop, z), f(pit.wallTop), new THREE.Vector3(-1, 0, 0));
+      const y = box.max.y + gap;
+      dim(new THREE.Vector3(pit.box.x0, y, z), new THREE.Vector3(pit.box.x1, y, z), `${f(pit.box.x1 - pit.box.x0)} × ${f(pit.box.y1 - pit.box.y0)} inside`, new THREE.Vector3(0, 1, 0));
+    } else if (m.orientation === 'vertical') {
       const x = box.min.x - gap;
       dim(new THREE.Vector3(x, box.min.y, z), new THREE.Vector3(x, box.max.y, z), f(box.max.y - box.min.y), new THREE.Vector3(-1, 0, 0));
       const y = box.max.y + gap;
@@ -966,7 +980,7 @@ export class TankViewer {
       this.surface = null;
     }
     if (show && level < e.depth - 1e-6) {
-      const g = buildSurface(m, e, this.geo.outline, h);
+      const g = d.kind === 'pit' ? buildPitSurface(d.pit, level) : this.geo.outline ? buildSurface(m, d.engine, this.geo.outline, h) : null;
       if (g) {
         this.surface = new THREE.Mesh(g, this.mats.surface);
         this.surface.renderOrder = 5;

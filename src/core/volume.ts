@@ -27,6 +27,33 @@ const GL_W = [
 
 const SAMPLES_PER_PIECE = 48;
 
+/**
+ * What every part of the app needs from a level → volume model, whatever the shape:
+ * the closed tanks below (VolumeEngine) and open concrete storages (PitEngine).
+ * Levels are mm above level zero (the lowest inside point), volumes mm³.
+ */
+export interface LevelEngine {
+  readonly depth: number;
+  readonly total: number;
+  readonly totalLitres: number;
+  readonly curveLevels: Float64Array;
+  readonly curveVolumes: Float64Array;
+  /** In-section axis cut by the liquid surface: 0 = u, 1 = v, -1 = none (no tilt). */
+  readonly axis: -1 | 0 | 1;
+  readonly na: number;
+  readonly nw: number;
+  readonly hMin: number;
+  readonly hMax: number;
+  volume(level: number): number;
+  litres(level: number): number;
+  levelOf(volume: number): number;
+  quickVolume(level: number): number;
+  surfaceArea(level: number): number;
+  levelOfPoint(a: number, u: number, v: number): number;
+  /** Levels where the shape changes (ends of heads, floor breaks): always kept in compact tables. */
+  breakLevels(): number[];
+}
+
 interface PieceCache {
   a0: number;
   a1: number;
@@ -38,7 +65,7 @@ interface PieceCache {
   full: number;
 }
 
-export class VolumeEngine {
+export class VolumeEngine implements LevelEngine {
   readonly model: TankModel;
   readonly tiltDeg: number;
   /** World-up components in the tank frame. */
@@ -282,6 +309,17 @@ export class VolumeEngine {
   /** Level of a tank-frame point above level zero. */
   levelOfPoint(a: number, u: number, v: number): number {
     return this.heightOf(a, u, v) - this.hMin;
+  }
+
+  /** Levels where the tank profile changes shape (junctions of shell and heads). */
+  breakLevels(): number[] {
+    const r: [number, number] = [0, 0];
+    const out: number[] = [];
+    for (const a of this.model.breaks) {
+      this.heightRange(a, r);
+      out.push(r[0] - this.hMin, r[1] - this.hMin);
+    }
+    return out.filter((L) => L > 0 && L < this.depth);
   }
 
   private cachePiece(a0: number, a1: number): PieceCache {

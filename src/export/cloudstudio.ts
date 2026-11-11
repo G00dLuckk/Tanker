@@ -1,30 +1,43 @@
 import { strapTable } from '../core/calibration';
 import { SENSOR_KINDS, isTopSensor } from '../core/defaults';
 import type { HeadProfile } from '../core/heads';
-import { levelFromMeasure } from '../core/sensors';
+import { checkValues, pitTable } from '../core/pit';
+import { levelFromMeasure, type SensorGeom } from '../core/sensors';
 import type { HeadConfig } from '../core/types';
 import { plain } from '../core/units';
-import { DECODER } from './csDecoders';
+import { decoderSource, type DecoderFamily } from './csDecoders';
 import { withCal, type Conversion, type ExportData } from './shared';
 
 /**
  * The configuration and payload scripts of the site on the Cloud Studio IoT platform
  * (iot.teknykar.com), in the layout of the scripts used on customer sites.
  *
- * Every distance sensor (ultrasonic, radar, laser) of every tank on the site is one
- * numbered entry of TANKS in the payload script, with its tank's sizes and the height
- * of the sensor above the inside floor. A device (DevEUI of a LoRaWAN sensor, or IMEI of
- * a SIM card sensor over TCP) is given the number of the sensor it is; several devices
- * can share a number (identical tanks).
+ * Every distance sensor (ultrasonic, radar, laser) of every tank or storage on the site
+ * is one numbered entry of TANKS in the payload script, with its tank's sizes (or, for a
+ * concrete storage, its level → litres table) and the height of the sensor above the
+ * inside floor. A device is given the number of the sensor it is; several devices can
+ * share a number (identical tanks).
+ *
+ * There is one device model per sensor family, never both in one:
+ *   LoRaWAN  devices by DevEUI (16 hex characters): TEK 766, Dragino, Milesight, Netvox…
+ *   TCP      SIM card sensors by IMEI (15 digits): TEK 811 / 811 LR / 822, JSON text
+ * The two families share the tank model, the level pipeline, the endpoints and the tests.
  *
  * Endpoints of a device with number n:
  *   "1"   Distance: the reading of the sensor (mm), as it sends it
+ *   "2"   Temperature (°C), when the sensor reports one
  *   n1    Liquid level (mm)      n2  Fill level (%)      n3  Volume (L)
  *
  * The payload script finds the device's number from its endpoints, works out from
  * the uplink which sensor model sent it, and computes the level as
  * sensorHeight − distance + levelOffset and the volume from the tank's sizes.
- * Scripts are plain ES5 (var, function, for loops), as the platform runs them.
+ *
+ * A sensor on a manhole cover carries that manhole in its entry, with its own sizes
+ * (never the tank's): the script adds up the sensor height from them (inside roof at
+ * the manhole + roof plate + neck + sensor above the cover) and, when the liquid stands
+ * above the roof inside the neck, adds that column with the opening's own area.
+ * Scripts are plain ES5 (var, function, for loops), as the platform runs them, and
+ * carry no comments.
  */
 
 /** Variable type ids of the platform, used on every site; the user can change them. */
@@ -32,6 +45,16 @@ export const DEFAULT_VAR_IDS: Record<string, number> = { mm: 1380, '%': 1406, L:
 
 /** Largest number of a sensor entry. */
 export const MAX_NUMBER = 9999;
+
+/** Sensor family of a device model: LoRaWAN (DevEUI) or SIM card sensors over TCP (IMEI). */
+export type CsFamily = DecoderFamily;
+
+export const FAMILY_LABEL: Record<CsFamily, string> = { lorawan: 'LoRaWAN (DevEUI)', tcp: 'TCP / SIM card (IMEI)' };
+
+/** Level → litres table step of a concrete storage (mm), and the coarser step used when the script would grow past ~50 kB. */
+export const PIT_TABLE_STEP = 10;
+export const PIT_TABLE_STEP_COARSE = 50;
+const PAYLOAD_SIZE_LIMIT = 50 * 1024;
 
 /** A value in the script: number, text, or a nested object / list of them. */
 type Lit = number | string | Lit[] | { [k: string]: Lit | undefined };
@@ -48,15 +71,17 @@ export interface CsEntry {
   tag: string;
   /** "Radar", "Ultrasonic"… */
   kind: string;
-  /** Face of the sensor above the inside floor of the tank (level 0), mm. */
+  /** Face of the sensor above the inside floor of the tank (level 0), mm. On a manhole: the sum of its parts. */
   sensorHeight: number;
+  /** The manhole the sensor sits on, as the script holds it; null on the roof, a bracket or a typed height. */
+  manhole: { [k: string]: Lit } | null;
   /** Correction of the level from field calibration (mm); 0 from the drawing. */
   levelOffset: number;
   /** Level change per mm of distance (1, or the calibrated / tilted value). */
   distanceScale: number;
   blindZone: number;
   maxRange: number;
-  /** How the script computes the volume: from the tank's sizes, or from a level → volume table. */
+  /** How the script computes the volume: from the tank's sizes, from a level → volume table, or a concrete storage's table. */
   shape: string;
   /** The tank part of the TANKS entry. */
   geometry: [string, Lit][];
@@ -75,6 +100,7 @@ export interface CsDevice {
 }
 
 export interface CsModel {
+  family: CsFamily;
   entries: CsEntry[];
   devices: CsDevice[];
   /** Plain-language problems: duplicate addresses, numbers with no sensor, shapes computed from a table… */
@@ -156,11 +182,25 @@ function headLit(h: HeadProfile, cfg: HeadConfig): { [k: string]: Lit } | null {
 }
 
 /**
- * The tank part of a TANKS entry: the sizes the script computes the volume from, or a
- * level → volume table for shapes it cannot compute (tilted, tapered, oval, eccentric cones…).
+ * The tank part of a TANKS entry: the sizes the script computes the volume from, a
+ * level → volume table for shapes it cannot compute (tilted, tapered, oval, eccentric
+ * cones…), or the level → litres table of a concrete storage.
  */
-function tankGeometry(ed: ExportData): { shape: string; fields: [string, Lit][]; why?: string } {
-  const m = ed.d.model;
+function tankGeometry(ed: ExportData, pitStep: number): { shape: string; fields: [string, Lit][]; why?: string } {
+  const d = ed.d;
+  if (d.kind === 'pit') {
+    const table = pitTable(d.engine, pitStep);
+    return {
+      shape: 'concretePit',
+      fields: [
+        ['shape', 'concretePit'],
+        ['maxLevel', n2(d.engine.depth)],
+        ['fullLitres', table[table.length - 1][1]],
+        ['table', table],
+      ],
+    };
+  }
+  const m = d.model;
   const p = ed.project;
   const vertical = m.orientation === 'vertical';
   const walls: [string, Lit][] = vertical
@@ -175,7 +215,7 @@ function tankGeometry(ed: ExportData): { shape: string; fields: [string, Lit][];
         ['rightEndThickness', m.t.end],
       ];
   const table = (why: string) => {
-    const rows = strapTable(ed.d.engine, { mode: 'compact', step: 10, rows: 50, tolerance: 0.05 });
+    const rows = strapTable(d.engine, { mode: 'compact', step: 10, rows: 50, tolerance: 0.05 });
     const shape = `${vertical ? 'standing' : 'lying'} ${m.bodyType}`;
     return {
       shape: 'table',
@@ -189,7 +229,7 @@ function tankGeometry(ed: ExportData): { shape: string; fields: [string, Lit][];
       ] as [string, Lit][],
     };
   };
-  if (Math.abs(ed.d.tilt) > 1e-9) return table('the tank is tilted');
+  if (Math.abs(d.tilt) > 1e-9) return table('the tank is tilted');
   if (m.profile || Math.abs(m.endScale - 1) > 1e-9) return table('the shell is tapered or stepped');
   if (m.bodyType === 'sphere') {
     return { shape: 'sphere', fields: [['shape', 'sphere'], ['insideDiameter', n2(2 * m.base.A)], ['wallThickness', m.t.shell]] };
@@ -226,6 +266,37 @@ function tankGeometry(ed: ExportData): { shape: string; fields: [string, Lit][];
   };
 }
 
+/** The parts the script adds up to the sensor height on a manhole, in this order. */
+const MANHOLE_HEIGHT_PARTS = ['roofHeight', 'roofThickness', 'neckHeight', 'sensorAboveCover'] as const;
+
+/**
+ * The manhole a sensor sits on, with its own sizes: the opening, the inside roof under its
+ * centre (the wall top on a concrete storage), the roof plate there, the neck up to the
+ * top of the cover, the cover plate and the sensor face above the cover.
+ */
+function manholeLit(g: SensorGeom): { [k: string]: Lit } | null {
+  const mg = g.manhole;
+  if (!mg) return null;
+  const mh = mg.manhole;
+  const out: { [k: string]: Lit } = { name: mh.tag };
+  if (mh.shape === 'round') {
+    out.shape = 'round';
+    out.insideDiameter = n2(mh.diameter);
+  } else {
+    out.shape = 'rectangular';
+    out.insideWidth = n2(mh.diameter);
+    out.insideLength = n2(mh.length);
+  }
+  out.roofHeight = n2(mg.roofLevel);
+  out.roofThickness = n2(mg.roofThickness);
+  out.neckHeight = n2(mg.neckHeight);
+  out.coverThickness = n2(Math.max(0, mh.cover));
+  out.sensorAboveCover = n2(g.sensor.nozzle);
+  // A tilted tank tilts its neck too: the liquid column in it is measured along the neck.
+  if (Math.abs(1 - g.cosTilt) > 1e-9) out.tilt = Number(((Math.acos(Math.min(1, Math.abs(g.cosTilt))) * 180) / Math.PI).toFixed(4));
+  return out;
+}
+
 /** Level (mm) = A + B × distance (mm) of a top sensor, with its field calibration. */
 function distanceFormula(c: Conversion, ed: ExportData): { A: number; B: number } {
   const g = c.geom;
@@ -235,17 +306,43 @@ function distanceFormula(c: Conversion, ed: ExportData): { A: number; B: number 
 
 /** A DevEUI (16 hex characters) or an IMEI (15 digits). */
 export function isAddress(a: string): boolean {
-  return a.length === 16 || (a.length === 15 && /^\d+$/.test(a));
+  return addressKind(a) !== null;
+}
+
+/** What kind of address a cleaned string is: a DevEUI (LoRaWAN), an IMEI (TCP) or neither. */
+export function addressKind(a: string): 'deveui' | 'imei' | null {
+  if (a.length === 16 && /^[0-9A-F]+$/i.test(a)) return 'deveui';
+  if (a.length === 15 && /^\d+$/.test(a)) return 'imei';
+  return null;
+}
+
+/** The family a device belongs to, by its address kind. */
+export function familyOfAddress(a: string): CsFamily | null {
+  const k = addressKind(a);
+  return k === 'deveui' ? 'lorawan' : k === 'imei' ? 'tcp' : null;
+}
+
+/** The family to generate when none is chosen: TCP when every device is an IMEI, else LoRaWAN. */
+export function resolveFamily(choice: CsFamily | 'auto' | undefined, devices: { address: string }[]): CsFamily {
+  if (choice === 'lorawan' || choice === 'tcp') return choice;
+  const kinds = devices.map((d) => familyOfAddress(cleanAddress(d.address))).filter((k): k is CsFamily => k !== null);
+  return kinds.length && kinds.every((k) => k === 'tcp') ? 'tcp' : 'lorawan';
 }
 
 const validNumber = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= MAX_NUMBER;
 
 /**
- * The site: every distance sensor of every tank, numbered, and the devices.
- * A sensor keeps the number it was given unless another sensor has it already;
- * sensors without a number take the lowest free one.
+ * The site: every distance sensor of every tank, numbered, and the devices of one
+ * sensor family. A sensor keeps the number it was given unless another sensor has it
+ * already; sensors without a number take the lowest free one.
  */
-export function cloudStudioModel(tanks: ExportData[], varIds: Record<string, number> = {}, devices: { address: string; number?: number }[] = []): CsModel {
+export function cloudStudioModel(
+  tanks: ExportData[],
+  varIds: Record<string, number> = {},
+  devices: { address: string; number?: number }[] = [],
+  familyChoice: CsFamily | 'auto' = 'auto',
+): CsModel {
+  const family = resolveFamily(familyChoice, devices);
   const warnings: string[] = [];
   const entries: CsEntry[] = [];
   const used = new Set<number>();
@@ -256,6 +353,16 @@ export function cloudStudioModel(tanks: ExportData[], varIds: Record<string, num
     if (left.length) warnings.push(`${ed.project.name}: ${left.map((s) => s.tag).join(', ')} left out. The scripts read distance sensors (ultrasonic, radar, laser) on the roof.`);
     for (const c of convs) pending.push({ ed, ti, c, many: convs.length > 1 });
     if (!convs.length) warnings.push(`${ed.project.name}: no distance sensor that can read a level, so it is not in the scripts.`);
+    if (ed.d.kind === 'pit') {
+      for (const r of checkValues(ed.d.engine)) {
+        if (r.ok) continue;
+        warnings.push(
+          Number.isFinite(r.errorPct)
+            ? `${ed.project.name}: the drawing gives ${Math.round(r.check.litres).toLocaleString('en-US')} L at ${Math.round(r.check.level)} mm, the design ${Math.round(r.litres).toLocaleString('en-US')} L (${r.errorPct > 0 ? '+' : ''}${r.errorPct.toFixed(2)} %). Check the plan, the floor slope and the wall height.`
+            : `${ed.project.name}: a drawing check value is 0 L and cannot be compared.`,
+        );
+      }
+    }
   });
   // Numbers set by the user first, in order; a repeated number is moved.
   const wanted = pending.map((x) => (validNumber(x.c.sensor.number) ? x.c.sensor.number : null));
@@ -264,6 +371,10 @@ export function cloudStudioModel(tanks: ExportData[], varIds: Record<string, num
     used.add(n);
     return n;
   });
+  // Concrete storages carry a 10 mm table; 50 mm when the whole script would grow past ~50 kB
+  // (about 16 characters per table pair on top of a 12 kB script).
+  const tableBytes = pending.reduce((s, x) => s + (x.ed.d.kind === 'pit' ? (x.ed.d.engine.depth / PIT_TABLE_STEP + 1) * 16 : 0), 0);
+  const pitStep = 12000 + tableBytes > PAYLOAD_SIZE_LIMIT ? PIT_TABLE_STEP_COARSE : PIT_TABLE_STEP;
   let next = 1;
   pending.forEach((x, i) => {
     let n = given[i];
@@ -277,9 +388,10 @@ export function cloudStudioModel(tanks: ExportData[], varIds: Record<string, num
     const g = c.geom;
     const s = c.sensor;
     const { A, B } = distanceFormula(c, ed);
-    const geo = tankGeometry(ed);
+    const geo = tankGeometry(ed, pitStep);
     if (geo.why) warnings.push(`${ed.project.name}: the volume comes from a level → volume table in the script because ${geo.why}.`);
-    const sensorHeight = n2(g.faceHeightUntilted);
+    const manhole = manholeLit(g);
+    const sensorHeight = manhole ? n2(MANHOLE_HEIGHT_PARTS.reduce((sum, k) => sum + (manhole[k] as number), 0)) : n2(g.faceHeightUntilted);
     entries.push({
       number: n,
       name: x.many ? `${ed.project.name} ${s.tag}` : ed.project.name,
@@ -289,6 +401,7 @@ export function cloudStudioModel(tanks: ExportData[], varIds: Record<string, num
       tag: s.tag,
       kind: SENSOR_KINDS[s.kind].short,
       sensorHeight,
+      manhole,
       levelOffset: n2(A - sensorHeight),
       distanceScale: Math.abs(B + 1) < 1e-9 ? 1 : Number((-B).toPrecision(10)),
       blindZone: Math.round(s.deadBand),
@@ -311,6 +424,15 @@ export function cloudStudioModel(tanks: ExportData[], varIds: Record<string, num
   for (const d of devices) {
     const address = cleanAddress(d.address);
     if (!address) continue;
+    const kind = familyOfAddress(address);
+    if (kind !== null && kind !== family) {
+      warnings.push(
+        kind === 'tcp'
+          ? `${address} is an IMEI (SIM card sensor over TCP): it belongs in the TCP model, not in this LoRaWAN one. Switch the sensor family to make that model.`
+          : `${address} is a DevEUI (LoRaWAN sensor): it belongs in the LoRaWAN model, not in this TCP one. Switch the sensor family to make that model.`,
+      );
+      continue;
+    }
     let number = validNumber(d.number) ? d.number : null;
     if (number === null) {
       number = free();
@@ -326,13 +448,13 @@ export function cloudStudioModel(tanks: ExportData[], varIds: Record<string, num
       warnings.push(`${address} is listed twice; it stays with number ${seen.get(address)}.`);
       continue;
     }
-    if (!isAddress(address)) warnings.push(`${address} is ${address.length} characters. A DevEUI has 16 hexadecimal characters, an IMEI 15 digits.`);
+    if (kind === null) warnings.push(`${address} is ${address.length} characters. A DevEUI has 16 hexadecimal characters, an IMEI 15 digits.`);
     seen.set(address, number);
     out.push({ address, number });
   }
-  for (const e of entries) if (!out.some((d) => d.number === e.number)) warnings.push(`${e.name} (number ${e.number}): no DevEUI yet.`);
+  for (const e of entries) if (!out.some((d) => d.number === e.number)) warnings.push(`${e.name} (number ${e.number}): no ${family === 'tcp' ? 'IMEI' : 'DevEUI'} yet.`);
   const ids = { ...DEFAULT_VAR_IDS, ...varIds };
-  return { entries, devices: out, warnings, varIds: { mm: ids.mm ?? 0, '%': ids['%'] ?? 0, L: ids.L ?? 0 } };
+  return { family, entries, devices: out, warnings, varIds: { mm: ids.mm ?? 0, '%': ids['%'] ?? 0, L: ids.L ?? 0 } };
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +472,8 @@ function lit(v: Lit, indent: string): string {
   if (typeof v === 'string') return q(v);
   if (Array.isArray(v)) {
     const items = v.map((x) => lit(x, indent + '  '));
-    return items.length > 10 ? `[\n${wrapList(items, indent + '  ', 10)}\n${indent}]` : `[${items.join(', ')}]`;
+    const nested = v.some((x) => Array.isArray(x));
+    return items.length > 10 ? `[\n${wrapList(items, indent + '  ', nested ? 6 : 10)}\n${indent}]` : `[${items.join(', ')}]`;
   }
   const keys = Object.keys(v).filter((k) => v[k] !== undefined);
   return `{ ${keys.map((k) => `${k}: ${lit(v[k] as Lit, indent)}`).join(', ')} }`;
@@ -372,22 +495,47 @@ function tidy(out: string[]): string {
   return kept.join('\n') + '\n';
 }
 
+/** What differs between the two device models in the configuration script. */
+const FAMILY_TEXT: Record<CsFamily, { label: string; normalise: string; bad: string; badEn: string; badEs: string; missingEn: string; missingEs: string }> = {
+  lorawan: {
+    label: 'DevEUI',
+    normalise: 'return String(address).replace(/[^0-9A-Fa-f]/g, "").toUpperCase();',
+    bad: 'clean.length != 16',
+    badEn: 'The DevEUI must be 16 hexadecimal characters',
+    badEs: 'El DevEUI debe tener 16 caracteres hexadecimales',
+    missingEn: 'This DevEUI is not in DEVICE_TANKS. Add it to the configuration script first.',
+    missingEs: 'Este DevEUI no está en DEVICE_TANKS. Agréguelo primero al script de configuración.',
+  },
+  tcp: {
+    label: 'IMEI',
+    normalise: 'return String(address).replace(/[^0-9]/g, "");',
+    bad: 'clean.length != 15',
+    badEn: 'The IMEI must be 15 digits',
+    badEs: 'El IMEI debe tener 15 dígitos',
+    missingEn: 'This IMEI is not in DEVICE_TANKS. Add it to the configuration script first.',
+    missingEs: 'Este IMEI no está en DEVICE_TANKS. Agréguelo primero al script de configuración.',
+  },
+};
+
 export function cloudStudioConfig(m: CsModel): string {
   const out: string[] = [];
   const id = (u: string) => m.varIds[u] ?? 0;
+  const F = FAMILY_TEXT[m.family];
   out.push(`var MM_VARIABLE_ID      = ${id('mm')};`, `var PERCENT_VARIABLE_ID = ${id('%')};`, `var LITRES_VARIABLE_ID  = ${id('L')};`, '');
   if (m.devices.length) {
     out.push('var DEVICE_TANKS = {');
     m.devices.forEach((d, i) => out.push(`  ${q(d.address)}: ${d.number}${i < m.devices.length - 1 ? ',' : ''}`));
     out.push('};', '');
   } else out.push('var DEVICE_TANKS = {', '};', '');
-  out.push('function normaliseAddress(address)', '{', '  return String(address).replace(/[^0-9A-Fa-f]/g, "").toUpperCase();', '}', '');
-  out.push('function getConfiguration(config)', '{', '  config.addressLabel = { en: "DevEUI / IMEI", es: "DevEUI / IMEI" };', '}', '');
+  out.push('function normaliseAddress(address)', '{', `  ${F.normalise}`, '}', '');
+  out.push('function getConfiguration(config)', '{', `  config.addressLabel = { en: ${q(F.label)}, es: ${q(F.label)} };`, '}', '');
   out.push(
     'function getEndpoints(deviceAddress, endpoints)',
     '{',
     '  var distance = endpoints.addEndpoint("1", "Distance", endpointType.genericSensor);',
     '  distance.variableTypeId = MM_VARIABLE_ID;',
+    '',
+    '  endpoints.addEndpoint("2", "Temperature", endpointType.temperatureSensor);',
     '',
     '  var tankNumber = DEVICE_TANKS[normaliseAddress(deviceAddress)];',
     '  if (!tankNumber)',
@@ -415,11 +563,11 @@ export function cloudStudioConfig(m: CsModel): string {
     '{',
     '  var clean = normaliseAddress(address);',
     '',
-    '  if (clean.length != 16 && !(clean.length == 15 && /^[0-9]+$/.test(clean))) {',
+    `  if (${F.bad}) {`,
     '    result.ok = false;',
     '    result.errorMessage = {',
-    '      en: "The address must be a DevEUI (16 hexadecimal characters) or an IMEI (15 digits)",',
-    '      es: "La dirección debe ser un DevEUI (16 caracteres hexadecimales) o un IMEI (15 dígitos)"',
+    `      en: ${q(F.badEn)},`,
+    `      es: ${q(F.badEs)}`,
     '    };',
     '    return;',
     '  }',
@@ -427,8 +575,8 @@ export function cloudStudioConfig(m: CsModel): string {
     '  if (!DEVICE_TANKS[clean]) {',
     '    result.ok = false;',
     '    result.errorMessage = {',
-    '      en: "This DevEUI / IMEI is not in DEVICE_TANKS. Add it to the configuration script first.",',
-    '      es: "Este DevEUI / IMEI no está en DEVICE_TANKS. Agréguelo primero al script de configuración."',
+    `      en: ${q(F.missingEn)},`,
+    `      es: ${q(F.missingEs)}`,
     '    };',
     '  }',
     '}',
@@ -439,7 +587,10 @@ export function cloudStudioConfig(m: CsModel): string {
   return tidy(out);
 }
 
-/** One TANKS entry, grouped like the customer scripts: sensor, tank sizes, sensor height. */
+/**
+ * One TANKS entry, grouped like the customer scripts: sensor, tank sizes, sensor height.
+ * A sensor on a manhole has the manhole's own sizes in place of a fixed sensor height.
+ */
 function entrySource(e: CsEntry, last: boolean): string[] {
   const out: string[] = [`  ${e.number}: {`];
   const groups: [string, Lit][][] = [
@@ -450,14 +601,22 @@ function entrySource(e: CsEntry, last: boolean): string[] {
       ['maxRange', e.maxRange],
     ],
     e.geometry,
+    ...(e.manhole ? [[['manhole', e.manhole]] as [string, Lit][]] : []),
     [
-      ['sensorHeight', e.sensorHeight],
+      ...(e.manhole ? [] : ([['sensorHeight', e.sensorHeight]] as [string, Lit][])),
       ['levelOffset', e.levelOffset],
       ...(e.distanceScale !== 1 ? ([['distanceScale', e.distanceScale]] as [string, Lit][]) : []),
     ],
   ];
   groups.forEach((g, gi) => {
-    g.forEach(([k, v], i) => out.push(`    ${k}: ${lit(v, '    ')}${gi === groups.length - 1 && i === g.length - 1 ? '' : ','}`));
+    g.forEach(([k, v], i) => {
+      const comma = gi === groups.length - 1 && i === g.length - 1 ? '' : ',';
+      if (k === 'manhole' && typeof v === 'object' && !Array.isArray(v)) {
+        // One size per line: this block is the one a fitter checks against the manhole.
+        const keys = Object.keys(v).filter((x) => v[x] !== undefined);
+        out.push('    manhole: {', ...keys.map((x, j) => `      ${x}: ${lit(v[x] as Lit, '      ')}${j < keys.length - 1 ? ',' : ''}`), `    }${comma}`);
+      } else out.push(`    ${k}: ${lit(v, '    ')}${comma}`);
+    });
     if (gi < groups.length - 1) out.push('');
   });
   out.push(`  }${last ? '' : ','}`);
@@ -465,7 +624,9 @@ function entrySource(e: CsEntry, last: boolean): string[] {
   return out;
 }
 
-const VOLUME_CODE = `function simpson(f, a, b, n)
+// Volume code, in pieces: a script only carries the functions of the shapes it holds.
+
+const HEAD_CODE = `function simpson(f, a, b, n)
 {
   if (b <= a)
     return 0;
@@ -534,8 +695,9 @@ function headIntegral(head, f, from, to, n)
     return simpson(f, from, b, n) + simpson(f, b, to, n);
   return simpson(f, from, to, n);
 }
+`;
 
-function segmentArea(r, y)
+const SEGMENT_CODE = `function segmentArea(r, y)
 {
   if (y <= 0 || r <= 0)
     return 0;
@@ -544,81 +706,10 @@ function segmentArea(r, y)
   var c = r - y;
   return r * r * Math.acos(c / r) - c * Math.sqrt(Math.max(0, 2 * r * y - y * y));
 }
+`;
 
-function tankGeometry(tank)
+const TABLE_CODE = `function tableVolume(tank, level)
 {
-  if (tank._geo)
-    return tank._geo;
-  var g = { maxLevel: 0, R: 0 };
-  if (tank.shape == "standing cylinder") {
-    g.R = tank.insideDiameter / 2;
-    g.maxLevel = tank.bottom.depth + tank.shellHeight + tank.top.depth;
-  }
-  else if (tank.shape == "lying cylinder") {
-    g.R = tank.insideDiameter / 2;
-    g.maxLevel = tank.insideDiameter;
-  }
-  else if (tank.shape == "sphere") {
-    g.R = tank.insideDiameter / 2;
-    g.maxLevel = tank.insideDiameter;
-  }
-  else if (tank.shape == "standing box")
-    g.maxLevel = tank.shellHeight;
-  else if (tank.shape == "lying box")
-    g.maxLevel = tank.insideHeight;
-  else
-    g.maxLevel = tank.level[tank.level.length - 1];
-  tank._geo = g;
-  g.fullLitres = liquidVolume(tank, g.maxLevel) / 1000000;
-  return g;
-}
-
-function liquidVolume(tank, level)
-{
-  var g = tankGeometry(tank);
-  if (level <= 0)
-    return 0;
-  if (level > g.maxLevel)
-    level = g.maxLevel;
-  var R = g.R;
-
-  if (tank.shape == "standing cylinder") {
-    var hb = tank.bottom.depth;
-    var area = function (t) { var r = headRadius(tank.bottom, R, t); return Math.PI * r * r; };
-    var v = headIntegral(tank.bottom, area, Math.max(0, hb - level), hb, 64);
-    v += Math.PI * R * R * Math.max(0, Math.min(level - hb, tank.shellHeight));
-    var up = level - hb - tank.shellHeight;
-    if (up > 0) {
-      var areaTop = function (t) { var r = headRadius(tank.top, R, t); return Math.PI * r * r; };
-      v += headIntegral(tank.top, areaTop, 0, Math.min(up, tank.top.depth), 64);
-    }
-    return v;
-  }
-
-  if (tank.shape == "lying cylinder") {
-    var vl = tank.shellLength * segmentArea(R, level);
-    var ends = [tank.leftEnd, tank.rightEnd];
-    for (var i = 0; i < 2; i++) {
-      var head = ends[i];
-      if (head.depth <= 0)
-        continue;
-      var slice = function (t) { var r = headRadius(head, R, t); return segmentArea(r, level - (R - r)); };
-      vl += headIntegral(head, slice, 0, head.depth, 400);
-    }
-    return vl;
-  }
-
-  if (tank.shape == "sphere")
-    return Math.PI * level * level * (3 * R - level) / 3;
-
-  if (tank.shape == "standing box") {
-    var c = tank.cornerRadius || 0;
-    return (tank.insideWidth * tank.insideDepth - (4 - Math.PI) * c * c) * level;
-  }
-
-  if (tank.shape == "lying box")
-    return tank.insideWidth * tank.shellLength * level;
-
   var xs = tank.level, ys = tank.litres, n = xs.length;
   if (level >= xs[n - 1])
     return ys[n - 1] * 1000000;
@@ -629,7 +720,151 @@ function liquidVolume(tank, level)
     else hi = mid;
   }
   return (ys[lo] + (ys[hi] - ys[lo]) * (level - xs[lo]) / (xs[hi] - xs[lo])) * 1000000;
-}`;
+}
+`;
+
+const PIT_CODE = `function pitVolume(tank, level)
+{
+  var t = tank.table;
+  if (level <= t[0][0])
+    return t[0][1];
+  for (var i = 1; i < t.length; i++) {
+    if (level <= t[i][0]) {
+      var a = t[i - 1], b = t[i];
+      return a[1] + (b[1] - a[1]) * (level - a[0]) / (b[0] - a[0]);
+    }
+  }
+  return t[t.length - 1][1];
+}
+`;
+
+/**
+ * Sensors on a manhole: the sensor height from the manhole's parts, and the liquid that
+ * stands in the neck above the inside roof, with the opening's own area. The neck runs
+ * from the inside roof under the manhole centre to the underside of the cover.
+ */
+const MANHOLE_CODE = `function manholeArea(m)
+{
+  if (m.shape == "round")
+    return Math.PI * m.insideDiameter * m.insideDiameter / 4;
+  return m.insideWidth * m.insideLength;
+}
+
+function sensorHeight(tank)
+{
+  var m = tank.manhole;
+  if (m == null)
+    return tank.sensorHeight;
+  return ${MANHOLE_HEIGHT_PARTS.map((k) => `m.${k}`).join(' + ')};
+}
+
+function neckTop(tank)
+{
+  var m = tank.manhole;
+  if (m == null)
+    return 0;
+  var c = Math.cos((m.tilt || 0) * Math.PI / 180);
+  return m.roofHeight + Math.max(0, m.roofThickness + m.neckHeight - m.coverThickness) * c;
+}
+
+function neckVolume(tank, level)
+{
+  var m = tank.manhole;
+  if (m == null)
+    return 0;
+  var rise = Math.min(level, neckTop(tank)) - m.roofHeight;
+  if (rise <= 0)
+    return 0;
+  return manholeArea(m) * rise / Math.cos((m.tilt || 0) * Math.PI / 180);
+}
+`;
+
+/** Shapes the payload script can hold, in the order their branches are written. */
+const SHAPES = ['standing cylinder', 'lying cylinder', 'sphere', 'standing box', 'lying box', 'table', 'concretePit'] as const;
+type Shape = (typeof SHAPES)[number];
+
+const GEOMETRY_BRANCH: Record<Shape, string[]> = {
+  'standing cylinder': ['    g.R = tank.insideDiameter / 2;', '    g.maxLevel = tank.bottom.depth + tank.shellHeight + tank.top.depth;'],
+  'lying cylinder': ['    g.R = tank.insideDiameter / 2;', '    g.maxLevel = tank.insideDiameter;'],
+  sphere: ['    g.R = tank.insideDiameter / 2;', '    g.maxLevel = tank.insideDiameter;'],
+  'standing box': ['    g.maxLevel = tank.shellHeight;'],
+  'lying box': ['    g.maxLevel = tank.insideHeight;'],
+  table: ['    g.maxLevel = tank.level[tank.level.length - 1];'],
+  concretePit: ['    g.maxLevel = tank.maxLevel;'],
+};
+
+const VOLUME_BRANCH: Record<Shape, string[]> = {
+  'standing cylinder': [
+    '  if (tank.shape == "standing cylinder") {',
+    '    var hb = tank.bottom.depth;',
+    '    var area = function (t) { var r = headRadius(tank.bottom, R, t); return Math.PI * r * r; };',
+    '    var v = headIntegral(tank.bottom, area, Math.max(0, hb - level), hb, 64);',
+    '    v += Math.PI * R * R * Math.max(0, Math.min(level - hb, tank.shellHeight));',
+    '    var up = level - hb - tank.shellHeight;',
+    '    if (up > 0) {',
+    '      var areaTop = function (t) { var r = headRadius(tank.top, R, t); return Math.PI * r * r; };',
+    '      v += headIntegral(tank.top, areaTop, 0, Math.min(up, tank.top.depth), 64);',
+    '    }',
+    '    return v;',
+    '  }',
+  ],
+  'lying cylinder': [
+    '  if (tank.shape == "lying cylinder") {',
+    '    var vl = tank.shellLength * segmentArea(R, level);',
+    '    var ends = [tank.leftEnd, tank.rightEnd];',
+    '    for (var i = 0; i < 2; i++) {',
+    '      var head = ends[i];',
+    '      if (head.depth <= 0)',
+    '        continue;',
+    '      var slice = function (t) { var r = headRadius(head, R, t); return segmentArea(r, level - (R - r)); };',
+    '      vl += headIntegral(head, slice, 0, head.depth, 400);',
+    '    }',
+    '    return vl;',
+    '  }',
+  ],
+  sphere: ['  if (tank.shape == "sphere")', '    return Math.PI * level * level * (3 * R - level) / 3;'],
+  'standing box': [
+    '  if (tank.shape == "standing box") {',
+    '    var c = tank.cornerRadius || 0;',
+    '    return (tank.insideWidth * tank.insideDepth - (4 - Math.PI) * c * c) * level;',
+    '  }',
+  ],
+  'lying box': ['  if (tank.shape == "lying box")', '    return tank.insideWidth * tank.shellLength * level;'],
+  table: ['  if (tank.shape == "table")', '    return tableVolume(tank, level);'],
+  concretePit: ['  if (tank.shape == "concretePit")', '    return pitVolume(tank, level) * 1000000;'],
+};
+
+/**
+ * The volume functions for the shapes in the script: liquidVolume works in mm³ for every shape.
+ * With manholes, the highest level a tank can show (topLevel) is the underside of the cover
+ * when that is above the tank's own top.
+ */
+export function volumeCode(used: Set<string>, manholes = false): string {
+  const shapes = SHAPES.filter((s) => used.has(s));
+  const out: string[] = [];
+  const cylinders = shapes.includes('standing cylinder') || shapes.includes('lying cylinder');
+  if (cylinders) out.push(HEAD_CODE);
+  if (shapes.includes('lying cylinder')) out.push(SEGMENT_CODE);
+  if (shapes.includes('table')) out.push(TABLE_CODE);
+  if (shapes.includes('concretePit')) out.push(PIT_CODE);
+  const usesR = cylinders || shapes.includes('sphere');
+  out.push('function tankGeometry(tank)', '{', '  if (tank._geo)', '    return tank._geo;', `  var g = { maxLevel: 0${usesR ? ', R: 0' : ''} };`);
+  shapes.forEach((s, i) => {
+    const body = GEOMETRY_BRANCH[s];
+    const cond = `${i === 0 ? '  if' : '  else if'} (tank.shape == ${q(s)})`;
+    if (body.length === 1) out.push(cond, body[0]);
+    else out.push(`${cond} {`, ...body, '  }');
+  });
+  out.push('  tank._geo = g;', '  g.fullLitres = liquidVolume(tank, g.maxLevel) / 1000000;');
+  if (manholes) out.push('  g.topLevel = Math.max(g.maxLevel, neckTop(tank));');
+  out.push('  return g;', '}', '');
+  out.push('function liquidVolume(tank, level)', '{', '  var g = tankGeometry(tank);', '  if (level <= 0)', '    return 0;', '  if (level > g.maxLevel)', '    level = g.maxLevel;');
+  if (usesR) out.push('  var R = g.R;');
+  out.push('');
+  shapes.forEach((s) => out.push(...VOLUME_BRANCH[s], ''));
+  out.push('  return 0;', '}');
+  return out.join('\n');
+}
 
 export function cloudStudioPayload(m: CsModel): string {
   const out: string[] = [];
@@ -639,6 +874,7 @@ export function cloudStudioPayload(m: CsModel): string {
   out.push('var SHOW_ALL_READINGS = true;', 'var LOG = true;', '');
   out.push('function log(message)', '{', '  if (LOG)', '    env.log(message);', '}', '');
   out.push('function updateEndpoint(device, address, value)', '{', '  var ep = device.endpoints.byAddress(address);', '  if (ep != null)', '    ep.updateGenericSensorStatus(value);', '}', '');
+  out.push('function updateTemperature(device, value)', '{', '  var ep = device.endpoints.byAddress("2");', '  if (ep != null)', '    ep.updateTemperatureSensorStatus(value);', '}', '');
   out.push(
     'function findTank(device)',
     '{',
@@ -650,8 +886,12 @@ export function cloudStudioPayload(m: CsModel): string {
     '}',
     '',
   );
-  out.push(VOLUME_CODE, '');
-  out.push(DECODER);
+  const used = new Set(m.entries.map((e) => e.shape));
+  if (!used.size) used.add('standing cylinder');
+  const manholes = m.entries.some((e) => e.manhole);
+  if (manholes) out.push(MANHOLE_CODE);
+  out.push(volumeCode(used, manholes), '');
+  out.push(decoderSource(m.family));
   out.push(
     'function invalidReason(tank, distance, invalid)',
     '{',
@@ -678,6 +918,8 @@ export function cloudStudioPayload(m: CsModel): string {
     '    device.updateDeviceBattery(r.battery);',
     '    text += (r.battery.voltage != null) ? "battery " + r.battery.voltage + " V, " : "battery " + r.battery.percentage + " %, ";',
     '  }',
+    '  if (r.temperature != null)',
+    '    updateTemperature(device, r.temperature);',
     '  if (r.info != null)',
     '    text += r.info + ", ";',
     '',
@@ -696,7 +938,11 @@ export function cloudStudioPayload(m: CsModel): string {
     '  }',
     '',
     '  var tank = found.tank;',
+    '  var g = tankGeometry(tank);',
+    `  var level = ${manholes ? 'sensorHeight(tank)' : 'tank.sensorHeight'} - distance * (tank.distanceScale || 1) + (tank.levelOffset || 0);`,
     '  var reason = invalidReason(tank, distance, r.invalid);',
+    '  if (reason == null && level < -100)',
+    '    reason = "distance is " + Math.round(-level) + " mm deeper than the floor";',
     '',
     '  if (reason == null || SHOW_ALL_READINGS)',
     '    updateEndpoint(device, "1", distance);',
@@ -707,13 +953,17 @@ export function cloudStudioPayload(m: CsModel): string {
     '    return;',
     '  }',
     '',
-    '  var g = tankGeometry(tank);',
-    '  var level = tank.sensorHeight - distance * (tank.distanceScale || 1) + (tank.levelOffset || 0);',
     '  if (level < 0) level = 0;',
-    '  if (level > g.maxLevel) level = g.maxLevel;',
-    '',
-    '  var litres = liquidVolume(tank, level) / 1000000;',
-    '  var percent = (g.fullLitres > 0) ? (litres / g.fullLitres) * 100 : 0;',
+    ...(manholes
+      ? [
+          '  if (level > g.topLevel) level = g.topLevel;',
+          '',
+          '  var neck = neckVolume(tank, level) / 1000000;',
+          '  var litres = liquidVolume(tank, level) / 1000000 + neck;',
+          '  var percent = (g.fullLitres > 0) ? (litres / g.fullLitres) * 100 : 0;',
+          '  if (percent > 100) percent = 100;',
+        ]
+      : ['  if (level > g.maxLevel) level = g.maxLevel;', '', '  var litres = liquidVolume(tank, level) / 1000000;', '  var percent = (g.fullLitres > 0) ? (litres / g.fullLitres) * 100 : 0;']),
     '',
     '  var levelOut = Math.round(level);',
     '  var percentOut = Math.round(percent * 10) / 10;',
@@ -725,7 +975,9 @@ export function cloudStudioPayload(m: CsModel): string {
     '',
     '  log(tank.name + ": " + text + "distance " + distance +',
     '      " mm, level " + levelOut + " mm, " + percentOut + " %, " + litresOut +',
-    '      " L of " + Math.round(g.fullLitres) + " L");',
+    ...(manholes
+      ? ['      " L of " + Math.round(g.fullLitres) + " L" +', '      ((neck > 0) ? ", " + Math.round(neck) + " L of it in the neck of manhole " + tank.manhole.name : ""));']
+      : ['      " L of " + Math.round(g.fullLitres) + " L");']),
     '}',
     '',
   );

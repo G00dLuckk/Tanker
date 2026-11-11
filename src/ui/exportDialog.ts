@@ -3,8 +3,9 @@ import { derive, type Derived } from '../core/derive';
 import { hasAdc, hasAnalog } from '../core/sensors';
 import type { Project, SiteDevice } from '../core/types';
 import { LENGTH, VOLUME, type LengthUnit, type VolumeUnit } from '../core/units';
-import { DEFAULT_VAR_IDS, MAX_NUMBER, cloudStudioConfig, cloudStudioModel, cloudStudioPayload, isAddress, parseDeviceLines, type CsModel } from '../export/cloudstudio';
+import { DEFAULT_VAR_IDS, FAMILY_LABEL, MAX_NUMBER, cloudStudioConfig, cloudStudioModel, cloudStudioPayload, isAddress, parseDeviceLines, resolveFamily, type CsFamily, type CsModel } from '../export/cloudstudio';
 import { csv, tableView } from '../export/data';
+import { siteDetails } from '../export/details';
 import { collect, type ExportData } from '../export/shared';
 import { copyText, download, h, icon } from './dom';
 import { FieldSet, lengthField, numField, segmented, selectField, type Field } from './fields';
@@ -15,11 +16,12 @@ const TABS: { id: ExportTab; label: string; ext: string; mime: string }[] = [
   { id: 'config', label: 'Configuration', ext: '-configuration.js', mime: 'text/javascript' },
   { id: 'payload', label: 'Payload', ext: '-payload.js', mime: 'text/javascript' },
   { id: 'table', label: 'Table', ext: '-table.csv', mime: 'text/csv' },
+  { id: 'details', label: 'Details', ext: '-details.md', mime: 'text/markdown' },
 ];
 
-/** The configuration and payload scripts share the site settings. */
+/** The configuration and payload scripts and the site details share the site settings. */
 function isScript(t: ExportTab): boolean {
-  return t === 'config' || t === 'payload';
+  return t === 'config' || t === 'payload' || t === 'details';
 }
 
 function slug(s: string): string {
@@ -40,6 +42,8 @@ export class ExportDialog {
   private fs = new FieldSet();
   private data: ExportData | null = null;
   private cs: CsModel | null = null;
+  /** Every tank of the site, as the scripts and details use them (mm, litres). */
+  private siteData: ExportData[] = [];
   /** Sensor number given to pasted DevEUIs that do not carry one. */
   private pasteNumber: number | undefined = undefined;
   /** Derived models of the other tanks of the site. */
@@ -100,7 +104,7 @@ export class ExportDialog {
             'div',
             null,
             h('h2', { id: 'export-title' }, 'Scripts & table'),
-            h('p', null, 'The configuration and payload scripts for every tank and sensor on the site, and the level-to-volume table of this tank.'),
+            h('p', null, 'The configuration and payload scripts for every tank and sensor on the site, the level-to-volume table of this tank, and the details of every tank (shape, sizes, sensors) to give to an AI assistant.'),
           ),
           close,
         ),
@@ -325,12 +329,35 @@ export class ExportDialog {
     const p = this.prefs;
     const cs = this.cs;
     const entries = cs?.entries ?? [];
+    // One device model per sensor family; the choice follows the devices until it is set by hand.
+    const family: CsFamily = cs?.family ?? resolveFamily(p.csFamily, st.state.devices);
+    const famField = segmented(
+      { store: { state: st.state, get project() { return st.project; }, update: (_c, fn) => { fn(st.state); this.buildOptions(); this.regenerate(); } } },
+      {
+        id: 'cs-family',
+        label: 'Device model for',
+        options: (Object.keys(FAMILY_LABEL) as CsFamily[]).map((k) => ({ value: k, label: FAMILY_LABEL[k] })),
+        get: () => family,
+        set: (v) => (p.csFamily = v),
+        change: [],
+      },
+    );
+    this.fs.add(famField);
     const els: HTMLElement[] = [
+      h('div', { class: 'cs-heading' }, 'Sensor family'),
+      famField.el,
+      h(
+        'p',
+        { class: 'panel-note' },
+        family === 'tcp'
+          ? 'SIM card sensors over TCP (TEK 811 / 811 LR / 822, the newer Tekelek cellular frame, or JSON text), each known by its IMEI (15 digits). A site with LoRaWAN sensors too needs a second model: switch above and copy both scripts again.'
+          : 'LoRaWAN sensors (TEK 766, Dragino, Milesight, Netvox, or an object decoded by the network server), each known by its DevEUI (16 hexadecimal characters). A site with SIM card sensors too needs a second model: switch above and copy both scripts again.',
+      ),
       h('div', { class: 'cs-heading' }, `Sensors (${entries.length})`),
       h(
         'p',
         { class: 'panel-note' },
-        'Every ultrasonic, radar or laser sensor of every tank on the site, with its number: a device with number 3 gets the endpoints 31, 32 and 33. The payload script works out from each uplink which sensor model sent it.',
+        'Every ultrasonic, radar or laser sensor of every tank and storage on the site, with its number: a device with number 3 gets the endpoints 31, 32 and 33. The payload script works out from each uplink which sensor model sent it.',
       ),
     ];
 
@@ -398,7 +425,7 @@ export class ExportDialog {
             'div',
             { class: 'cs-entry-text' },
             h('span', { class: 'cs-entry-name' }, e.name),
-            h('span', { class: 'cs-entry-sub' }, `${e.kind} ${e.tag} · ${e.shape === 'table' ? 'volume from a table' : e.shape} · ${count} device${count === 1 ? '' : 's'}`),
+            h('span', { class: 'cs-entry-sub' }, `${e.kind} ${e.tag} · ${e.shape === 'table' ? 'volume from a table' : e.shape === 'concretePit' ? 'concrete storage, level → litres table' : e.shape} · ${count} device${count === 1 ? '' : 's'}`),
           ),
         ),
       );
@@ -560,9 +587,10 @@ export class ExportDialog {
         // Every tank of the site, in mm: the scripts work in mm and litres.
         const st = ctx.store.state;
         const eds = st.tanks.map((t) => collect(t, this.derivedOf(t), { ...opt, source: 'level', lengthUnit: 'mm', volumeUnit: 'L' }));
-        const sig = (m: CsModel | null) => (m ? JSON.stringify([m.warnings, m.entries.map((e) => [e.number, e.name, e.shape]), m.devices, m.varIds]) : '');
+        const sig = (m: CsModel | null) => (m ? JSON.stringify([m.family, m.warnings, m.entries.map((e) => [e.number, e.name, e.shape]), m.devices, m.varIds]) : '');
         const before = sig(this.cs);
-        this.cs = cloudStudioModel(eds, p.csVarIds, st.devices);
+        this.siteData = eds;
+        this.cs = cloudStudioModel(eds, p.csVarIds, st.devices, p.csFamily);
         // Sensors, warnings and device counts are shown with the options: rebuild them when they change.
         if (before !== sig(this.cs)) this.buildOptions();
       }
@@ -615,13 +643,13 @@ export class ExportDialog {
       this.meta.textContent = `${t.rows.length} rows`;
       return;
     }
-    this.text = this.cs ? (tab === 'config' ? cloudStudioConfig(this.cs) : cloudStudioPayload(this.cs)) : '';
+    this.text = this.cs ? (tab === 'config' ? cloudStudioConfig(this.cs) : tab === 'details' ? siteDetails(this.siteData, this.cs) : cloudStudioPayload(this.cs)) : '';
     const code = h('code', null, this.text);
     this.view.replaceChildren(h('pre', { class: `code code-${tab}` }, code));
     const lines = this.text.split('\n').length - 1;
     const kb = new Blob([this.text]).size / 1024;
     const n = this.cs?.entries.length ?? 0;
-    const tanks = new Set(this.cs?.entries.map((e) => e.tankIndex)).size;
+    const tanks = tab === 'details' ? this.siteData.length : new Set(this.cs?.entries.map((e) => e.tankIndex)).size;
     this.meta.textContent = `${tanks} tank${tanks === 1 ? '' : 's'} · ${n} sensor${n === 1 ? '' : 's'} · ${lines} lines · ${kb < 10 ? kb.toFixed(1) : Math.round(kb)} kB`;
   }
 
@@ -646,7 +674,8 @@ export class ExportDialog {
     this.flush();
     const tab = TABS.find((t) => t.id === this.prefs.tab)!;
     const name = isScript(tab.id) && this.ctx.store.state.tanks.length > 1 ? 'site' : this.ctx.store.project.name;
-    download(`${slug(name)}${tab.ext}`, this.text, tab.mime);
+    const fam = isScript(tab.id) && tab.id !== 'details' && this.cs ? `-${this.cs.family}` : '';
+    download(`${slug(name)}${fam}${tab.ext}`, this.text, tab.mime);
   }
 }
 

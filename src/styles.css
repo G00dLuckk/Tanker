@@ -2092,6 +2092,12 @@ select {
   opacity: 0.75;
 }
 
+/* The tank details are prose: wrap long lines. */
+.code-details {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .export-main {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);
@@ -2334,6 +2340,11 @@ select {
   padding: 3px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
+}
+
+.mini-table td.is-bad {
+  color: var(--critical);
+  font-weight: 600;
 }
 
 .mini-table td.num {

@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { defaultSensor, emptyProject } from '../src/core/defaults';
+import { defaultHead, defaultManhole, defaultSensor, emptyProject } from '../src/core/defaults';
 import { derive } from '../src/core/derive';
+import { defaultPit } from '../src/core/pit';
+import { rectangle } from '../src/core/polygon';
 import { PRESETS } from '../src/core/presets';
-import type { Project, SensorKind } from '../src/core/types';
+import { levelFromMeasure } from '../src/core/sensors';
+import type { ManholeConfig, Project, SensorConfig, SensorKind } from '../src/core/types';
 import { MM3_TO_L } from '../src/core/units';
 import { cloudStudioConfig, cloudStudioModel, cloudStudioPayload, parseDeviceLines, type CsModel } from '../src/export/cloudstudio';
 import { collect, type ExportData, type ExportOptions } from '../src/export/shared';
@@ -59,7 +62,7 @@ function mockDevice(eps: Ep[]) {
     endpoints: {
       byAddress: (a: string) => {
         const e = eps.find((x) => x.address === a);
-        return e ? { updateGenericSensorStatus: (v: number) => (e.value = v) } : null;
+        return e ? { updateGenericSensorStatus: (v: number) => (e.value = v), updateTemperatureSensorStatus: (v: number) => (e.value = v) } : null;
       },
     },
     updateDeviceBattery: (b: unknown) => (device.battery = b),
@@ -100,8 +103,8 @@ function tankProject(name: string, height: number, sensors: ReturnType<typeof de
 
 const eds = (ps: Project[]): ExportData[] => ps.map((p) => collect(p, derive(p), opts));
 
-function site(ps: Project[], devices: { address: string; number?: number }[]): CsModel {
-  return cloudStudioModel(eds(ps), {}, devices);
+function site(ps: Project[], devices: { address: string; number?: number }[], family: 'auto' | 'lorawan' | 'tcp' = 'auto'): CsModel {
+  return cloudStudioModel(eds(ps), {}, devices, family);
 }
 
 /** Creates the device from the configuration script and sends it one uplink. */
@@ -138,13 +141,15 @@ function normaliseAddress(address)
 
 function getConfiguration(config)
 {
-  config.addressLabel = { en: "DevEUI / IMEI", es: "DevEUI / IMEI" };
+  config.addressLabel = { en: "DevEUI", es: "DevEUI" };
 }
 
 function getEndpoints(deviceAddress, endpoints)
 {
   var distance = endpoints.addEndpoint("1", "Distance", endpointType.genericSensor);
   distance.variableTypeId = MM_VARIABLE_ID;
+
+  endpoints.addEndpoint("2", "Temperature", endpointType.temperatureSensor);
 
   var tankNumber = DEVICE_TANKS[normaliseAddress(deviceAddress)];
   if (!tankNumber)
@@ -170,11 +175,11 @@ function validateDeviceAddress(address, result)
 {
   var clean = normaliseAddress(address);
 
-  if (clean.length != 16 && !(clean.length == 15 && /^[0-9]+$/.test(clean))) {
+  if (clean.length != 16) {
     result.ok = false;
     result.errorMessage = {
-      en: "The address must be a DevEUI (16 hexadecimal characters) or an IMEI (15 digits)",
-      es: "La dirección debe ser un DevEUI (16 caracteres hexadecimales) o un IMEI (15 dígitos)"
+      en: "The DevEUI must be 16 hexadecimal characters",
+      es: "El DevEUI debe tener 16 caracteres hexadecimales"
     };
     return;
   }
@@ -182,8 +187,8 @@ function validateDeviceAddress(address, result)
   if (!DEVICE_TANKS[clean]) {
     result.ok = false;
     result.errorMessage = {
-      en: "This DevEUI / IMEI is not in DEVICE_TANKS. Add it to the configuration script first.",
-      es: "Este DevEUI / IMEI no está en DEVICE_TANKS. Agréguelo primero al script de configuración."
+      en: "This DevEUI is not in DEVICE_TANKS. Add it to the configuration script first.",
+      es: "Este DevEUI no está en DEVICE_TANKS. Agréguelo primero al script de configuración."
     };
   }
 }
@@ -205,32 +210,48 @@ function updateEndpointUIRules(endpoint, rules)
     const eps = endpointsFor(cloudStudioConfig(m), 'a840-41f3-5961-8158');
     expect(eps.map((e) => [e.address, e.name, e.variableTypeId])).toEqual([
       ['1', 'Distance', 1380],
+      ['2', 'Temperature', undefined],
       ['11', 'Liquid level', 1380],
       ['12', 'Fill level', 1406],
       ['13', 'Volume', 1371],
     ]);
-    expect(endpointsFor(cloudStudioConfig(m), 'A840410000000000').map((e) => e.address)).toEqual(['1']);
+    expect(endpointsFor(cloudStudioConfig(m), 'A840410000000000').map((e) => e.address)).toEqual(['1', '2']);
   });
 
-  it('checks the DevEUI or IMEI', () => {
-    const m = site([tankProject('Tank 7', 9060, [top('radar', 'LT-101')])], [{ address: 'A84041F359618158', number: 1 }, { address: '866207058378443', number: 1 }]);
-    const s = load(cloudStudioConfig(m));
-    const check = (a: string) => {
+  it('one model per sensor family: the LoRaWAN model checks DevEUIs, the TCP model IMEIs', () => {
+    const p = tankProject('Tank 7', 9060, [top('radar', 'LT-101')]);
+    const devices = [{ address: 'A84041F359618158', number: 1 }, { address: '866207058378443', number: 1 }];
+    const check = (m: CsModel, a: string) => {
       const r: { ok: boolean; errorMessage?: { en: string } } = { ok: true };
-      s.validateDeviceAddress!(a, r);
+      load(cloudStudioConfig(m)).validateDeviceAddress!(a, r);
       return r.ok ? 'ok' : r.errorMessage!.en;
     };
-    expect(check('A84041F359618158')).toBe('ok');
-    expect(check('866207058378443')).toBe('ok');
-    expect(check('A84041F3596181')).toBe('The address must be a DevEUI (16 hexadecimal characters) or an IMEI (15 digits)');
-    expect(check('A84041F35961815')).toBe('The address must be a DevEUI (16 hexadecimal characters) or an IMEI (15 digits)');
-    expect(check('A840410000000000')).toBe('This DevEUI / IMEI is not in DEVICE_TANKS. Add it to the configuration script first.');
-    expect(check('866207058378444')).toBe('This DevEUI / IMEI is not in DEVICE_TANKS. Add it to the configuration script first.');
+    // Mixed devices: LoRaWAN by default; the IMEI is left for the TCP model.
+    const lora = site([p], devices);
+    expect(lora.family).toBe('lorawan');
+    expect(lora.devices.map((d) => d.address)).toEqual(['A84041F359618158']);
+    expect(lora.warnings).toContain('866207058378443 is an IMEI (SIM card sensor over TCP): it belongs in the TCP model, not in this LoRaWAN one. Switch the sensor family to make that model.');
+    expect(check(lora, 'A84041F359618158')).toBe('ok');
+    expect(check(lora, 'a8:40:41:f3:59:61:81:58')).toBe('ok');
+    expect(check(lora, 'A84041F3596181')).toBe('The DevEUI must be 16 hexadecimal characters');
+    expect(check(lora, '866207058378443')).toBe('The DevEUI must be 16 hexadecimal characters');
+    expect(check(lora, 'A840410000000000')).toBe('This DevEUI is not in DEVICE_TANKS. Add it to the configuration script first.');
+    const tcp = site([p], devices, 'tcp');
+    expect(tcp.family).toBe('tcp');
+    expect(tcp.devices.map((d) => d.address)).toEqual(['866207058378443']);
+    expect(cloudStudioConfig(tcp)).toContain('config.addressLabel = { en: "IMEI", es: "IMEI" };');
+    expect(cloudStudioConfig(tcp)).toContain('return String(address).replace(/[^0-9]/g, "");');
+    expect(check(tcp, '866207058378443')).toBe('ok');
+    expect(check(tcp, '8662 0705 8378 443')).toBe('ok');
+    expect(check(tcp, 'A84041F359618158')).toBe('The IMEI must be 15 digits');
+    expect(check(tcp, '866207058378444')).toBe('This IMEI is not in DEVICE_TANKS. Add it to the configuration script first.');
+    // Only IMEIs listed: the TCP model is chosen by itself.
+    expect(site([p], [{ address: '866207058378443' }]).family).toBe('tcp');
   });
 
   it('leaves the percent and volume endpoints out without their ids', () => {
     const m = cloudStudioModel(eds([tankProject('T', 3000, [top('radar', 'LT-101')])]), { '%': 0, L: 0 }, [{ address: 'A84041F359618158' }]);
-    expect(endpointsFor(cloudStudioConfig(m), 'A84041F359618158').map((e) => e.address)).toEqual(['1', '11']);
+    expect(endpointsFor(cloudStudioConfig(m), 'A84041F359618158').map((e) => e.address)).toEqual(['1', '2', '11']);
   });
 });
 
@@ -304,10 +325,25 @@ describe('the sensor reading on Distance, the level from the sensor height', () 
   });
 
   it('the level stays inside the tank', () => {
-    expect(val(send(m, 'A84041F359618158', SEND.dragino(10000)), '11')).toBe(0);
+    // Up to 100 mm below the floor is rounding and reads as empty.
+    expect(val(send(m, 'A84041F359618158', SEND.dragino(9150)), '11')).toBe(0);
     // A sensor on a 1 m stand-pipe: 300 mm from it is above the inside top.
     const high = site([tankProject('Tank 7', 9060, [top('radar', 'LT-101', { nozzle: 1000, deadBand: 200 })])], [{ address: 'A84041F359618158' }]);
     expect(val(send(high, 'A84041F359618158', SEND.dragino(300)), '11')).toBe(9060);
+  });
+
+  it('a reading more than 100 mm deeper than the floor is invalid', () => {
+    const logs: string[] = [];
+    const eps = send(m, 'A84041F359618158', SEND.dragino(10000), logs);
+    expect(val(eps, '1')).toBe(10000);
+    expect(val(eps, '11')).toBeUndefined();
+    expect(logs[0]).toMatch(/is INVALID \(distance is 935 mm deeper than the floor\)\. Level not updated\.$/);
+  });
+
+  it('the temperature of a Tekelek frame goes to endpoint 2', () => {
+    const eps = send(m, 'A84041F359618158', { port: 48, asBytes: () => bytes('300000010106360063006300040600181BAA') });
+    expect(val(eps, '2')).toBe(27);
+    expect(val(eps, '1')).toBe(240);
   });
 
   it('a field calibration moves the level by levelOffset', () => {
@@ -324,7 +360,7 @@ describe('the sensor reading on Distance, the level from the sensor height', () 
   it('a device that is not in DEVICE_TANKS only gets its Distance', () => {
     const logs: string[] = [];
     const eps = send(m, 'A840410000000000', SEND.dragino(1234), logs);
-    expect(eps.map((e) => [e.address, e.value])).toEqual([['1', 1234]]);
+    expect(eps.map((e) => [e.address, e.value])).toEqual([['1', 1234], ['2', undefined]]);
     expect(logs[0]).toMatch(/No tank endpoints on this device/);
   });
 });
@@ -427,7 +463,7 @@ describe('many tanks, many sensors', () => {
     for (const e of m.entries) {
       const address = devices[e.number - 1].address;
       const eps = send(m, address, SEND.dragino(1000));
-      expect(eps.map((x) => x.address)).toEqual(['1', `${e.number}1`, `${e.number}2`, `${e.number}3`]);
+      expect(eps.map((x) => x.address)).toEqual(['1', '2', `${e.number}1`, `${e.number}2`, `${e.number}3`]);
       const level = e.sensorHeight - 1000;
       expect(val(eps, `${e.number}1`)).toBe(Math.round(level));
       expect(val(eps, `${e.number}3`)).toBe(Math.round(e.ed.d.engine.volume(level) * MM3_TO_L));
@@ -468,13 +504,19 @@ describe('many tanks, many sensors', () => {
   });
 
   it('a device without a number goes into the scripts at once, on the next sensor without a device', () => {
-    const m = site(ps, [{ address: 'A840410000000001', number: 1 }, { address: 'A840410000000002' }, { address: '866207058378443' }]);
+    const m = site(ps, [{ address: 'A840410000000001', number: 1 }, { address: 'A840410000000002' }, { address: 'A840410000000003' }]);
     expect(m.devices).toEqual([
       { address: 'A840410000000001', number: 1 },
       { address: 'A840410000000002', number: 2 },
-      { address: '866207058378443', number: 3 },
+      { address: 'A840410000000003', number: 3 },
     ]);
-    expect(cloudStudioConfig(m)).toContain('"866207058378443": 3');
+    expect(cloudStudioConfig(m)).toContain('"A840410000000003": 3');
+    const t = site(ps, [{ address: '866207058378443' }, { address: '866207058378444', number: 4 }]);
+    expect(t.family).toBe('tcp');
+    expect(t.devices).toEqual([
+      { address: '866207058378443', number: 1 },
+      { address: '866207058378444', number: 4 },
+    ]);
   });
 
   it('bottom sensors and switches are left out with a note', () => {
@@ -493,7 +535,19 @@ describe('SIM card sensors over TCP, by IMEI', () => {
   const sample = '072102018B06340866425030672135047B00018D03DC3C8201000A632877';
 
   it('the IMEI device gets its endpoints', () => {
-    expect(endpointsFor(cloudStudioConfig(m), '866207058378443').map((e) => e.address)).toEqual(['1', '11', '12', '13']);
+    expect(m.family).toBe('tcp');
+    expect(endpointsFor(cloudStudioConfig(m), '866207058378443').map((e) => e.address)).toEqual(['1', '2', '11', '12', '13']);
+  });
+
+  it('the TCP model carries only the TCP decoders; the LoRaWAN model only the LoRaWAN ones', () => {
+    const tcp = cloudStudioPayload(m);
+    expect(tcp).toContain('function decodeTek811');
+    expect(tcp).not.toContain('function decodeDragino');
+    expect(tcp).not.toContain('function decodeMilesight');
+    const lora = cloudStudioPayload(site([p], [{ address: 'A84041F359618158' }]));
+    expect(lora).toContain('function decodeTekelek');
+    expect(lora).toContain('function decodeDragino');
+    expect(lora).not.toContain('function decodeTek811');
   });
 
   it('TEK 811 as bytes and as hex text', () => {
@@ -516,11 +570,262 @@ describe('SIM card sensors over TCP, by IMEI', () => {
     expect(logs[0]).toMatch(/message type 10 \(settings, diagnostics or GPS\), ignored$/);
   });
 
+  // A frame a sensor sent to the platform (product byte 0x22): IMEI in bytes 9-16, 6-byte readings
+  // from byte 46 (status, status, temperature, SRC / SRSSI, ullage mm), CRC-16/XMODEM at the end.
+  const cellHead = '2205270800000544600868206088952001005800002000091900007fb50005121326004604500106000000000000';
+  const crc16 = (b: number[]) => {
+    let c = 0;
+    for (const x of b) {
+      c ^= x << 8;
+      for (let k = 0; k < 8; k++) c = c & 0x8000 ? ((c << 1) ^ 0x1021) & 0xffff : (c << 1) & 0xffff;
+    }
+    return c;
+  };
+  const cellFrame = (readings: string[], head = cellHead) => {
+    const body = bytes(head + readings.join('') + '000000000000'.repeat(10 - readings.length));
+    return [...body, ...be16(crc16(body))];
+  };
+  const cellSeen = ['001019aa0220', '001019aa023a', '001019a8023d', '000119a802c4'];
+  const cellHex = `${cellHead}${cellSeen.join('')}${'00'.repeat(36)}c683`;
+
+  it('the newer Tekelek cellular frame (product 0x22), exactly as the platform logged it', () => {
+    expect(cellFrame(cellSeen)).toEqual(bytes(cellHex));
+    const s = load(cloudStudioPayload(m));
+    const want = { model: 'Tekelek sensor 0x22', distance: 544, temperature: 25, battery: null, invalid: null, skip: null, info: 'ullage 544 mm, SRC 10, SRSSI 10, temperature 25 C' };
+    expect(s.decodeReading!({ asBytes: () => bytes(cellHex) })).toEqual(want);
+    expect(s.decodeReading!({ asBytes: () => [...cellHex.toUpperCase()].map((c) => c.charCodeAt(0)) })).toEqual(want);
+    const logs: string[] = [];
+    const eps = send(m, '866207058378443', { asBytes: () => bytes(cellHex) }, logs);
+    expect(val(eps, '1')).toBe(544);
+    expect(val(eps, '2')).toBe(25);
+    expect(val(eps, '11')).toBe(4005 - 544);
+    expect(logs[0]).toMatch(/^Tank 7: Tekelek sensor 0x22, ullage 544 mm, SRC 10, SRSSI 10, temperature 25 C, distance 544 mm, level 3461 mm, /);
+  });
+
+  it('cellular frame: the newest reading with data is used, a weak echo is refused', () => {
+    const s = load(cloudStudioPayload(m));
+    const read = (b: number[]) => s.decodeReading!({ asBytes: () => b });
+    expect(read(cellFrame(['000000000000', '0010e7a80bb8']))).toMatchObject({ distance: 3000, temperature: -25, invalid: null, info: 'ullage 3000 mm, SRC 10, SRSSI 8, temperature -25 C' });
+    expect(read(cellFrame(['0010193a0220'])).invalid).toBe('SRC 3 = noisy reflections, check alignment or obstructions');
+    expect(read(cellFrame(['001019a20220'])).invalid).toBe('SRSSI 2 is below 4, weak echo');
+    expect(read(cellFrame(['001019aa0000'])).invalid).toBe('0 = no reading');
+    const logs: string[] = [];
+    const eps = send(m, '866207058378443', { asBytes: () => cellFrame(['0010193a0220']) }, logs);
+    expect(val(eps, '11')).toBeUndefined();
+    expect(logs[0]).toMatch(/distance 544 mm is INVALID \(SRC 3 = noisy reflections/);
+  });
+
+  it('cellular frame: no reading, a text message, a cut frame', () => {
+    const s = load(cloudStudioPayload(m));
+    const read = (b: number[]) => s.decodeReading!({ asBytes: () => b });
+    expect(read(cellFrame([]))).toMatchObject({ model: 'Tekelek sensor 0x22', distance: null, skip: 'no measurement in the frame (108 bytes)' });
+    const text = [...'S0=80,S1=05,S2=7F0038,S3=64,S4=081E,S5=8832'].map((c) => c.charCodeAt(0));
+    const settings = [...bytes(cellHead.slice(0, 38)), ...text];
+    expect(read([...settings, ...be16(crc16(settings))])).toMatchObject({ distance: null, skip: 'settings or information message, ignored' });
+    // Cut after the second reading: the first one is still whole, the checksum can no longer match.
+    const cut = bytes(cellHex).slice(0, 58);
+    expect(read(cut)).toMatchObject({ distance: 544, info: 'ullage 544 mm, SRC 10, SRSSI 10, temperature 25 C, checksum does not match (frame cut short or joined)' });
+    // A TEK 811 frame is still read by its own layout.
+    expect(read(bytes(sample))).toMatchObject({ model: 'Tekelek TEK 811', distance: 1190 });
+  });
+
   it('JSON text from a SIM card device', () => {
     const text = JSON.stringify({ imei: '866207058378443', distance: 1500, battery: 3.6 });
     const eps = send(m, '866207058378443', { asBytes: () => [...text].map((c) => c.charCodeAt(0)), asJsonObject: () => { throw new Error('no'); } });
     expect(val(eps, '1')).toBe(1500);
     expect(val(eps, '11')).toBe(4005 - 1500);
+  });
+});
+
+describe('a sensor on a manhole: the script holds the manhole with its own sizes', () => {
+  const address = 'A840410000000001';
+  /** Puts a manhole on the project and a radar on its cover. */
+  function onManhole(p: Project, mh: Partial<ManholeConfig>, sensor: Partial<SensorConfig> = {}): Project {
+    const m: ManholeConfig = { ...defaultManhole('MH-1'), ...mh };
+    p.tank.manholes = [m];
+    p.sensors = [top('radar', 'LT-1', { x: m.x, y: m.y, faceMode: 'manhole', manhole: m.id, nozzle: 0, deadBand: 80, ...sensor })];
+    return p;
+  }
+  const model = (p: Project) => site([p], [{ address, number: 1 }]);
+  const run = (m: CsModel, distance: number, logs: string[] = []) => send(m, address, SEND.ttn(distance), logs);
+  const litresOf = (mm3: number) => mm3 * MM3_TO_L;
+
+  // Inside Ø 2000 × 4000 with a 5 mm flat roof; manhole Ø 600 with a 600 mm neck and a 10 mm cover.
+  const steel = () => onManhole(tankProject('Tank M', 4000, []), { diameter: 600, neck: 600, cover: 10 });
+  const tankFull = Math.PI * 1000 * 1000 * 4000;
+  const neckArea = Math.PI * 300 * 300;
+
+  it('the entry lists the manhole, not the tank size, and the sensor height is the sum of its parts', () => {
+    const m = model(steel());
+    const e = m.entries[0];
+    expect(e.manhole).toEqual({ name: 'MH-1', shape: 'round', insideDiameter: 600, roofHeight: 4000, roofThickness: 5, neckHeight: 600, coverThickness: 10, sensorAboveCover: 0 });
+    expect(e.sensorHeight).toBe(4000 + 5 + 600 + 0);
+    expect(e.levelOffset).toBe(0);
+    const payload = cloudStudioPayload(m);
+    const tank = load(payload).TANKS![1];
+    expect(tank.manhole).toEqual(e.manhole);
+    expect(tank.sensorHeight).toBeUndefined();
+    expect(tank).toMatchObject({ shape: 'standing cylinder', insideDiameter: 2000, shellHeight: 4000 });
+    expect(payload).toContain('function sensorHeight(tank)');
+    expect(payload).toContain('return m.roofHeight + m.roofThickness + m.neckHeight + m.sensorAboveCover;');
+    expect(payload).toContain('var level = sensorHeight(tank) - distance');
+    expect(payload).not.toContain('//');
+  });
+
+  it('below the roof the manhole changes nothing but the sensor height', () => {
+    const eps = run(model(steel()), 1605);
+    expect(val(eps, '11')).toBe(3000);
+    expect(val(eps, '12')).toBe(75);
+    expect(val(eps, '13')).toBe(Math.round(litresOf(Math.PI * 1000 * 1000 * 3000)));
+  });
+
+  it('liquid in the neck is added with the area of the opening, not of the tank', () => {
+    const m = model(steel());
+    const logs: string[] = [];
+    let eps = run(m, 405, logs);
+    expect(val(eps, '11')).toBe(4200);
+    expect(val(eps, '12')).toBe(100);
+    expect(val(eps, '13')).toBe(Math.round(litresOf(tankFull + neckArea * 200)));
+    expect(logs[0]).toMatch(/level 4200 mm, 100 %, 12623 L of 12566 L, 57 L of it in the neck of manhole MH-1$/);
+    eps = run(m, 100);
+    expect(val(eps, '11')).toBe(4505);
+    expect(val(eps, '13')).toBe(Math.round(litresOf(tankFull + neckArea * 505)));
+    // At the roof itself nothing is added yet.
+    const at = run(m, 605, logs);
+    expect(val(at, '11')).toBe(4000);
+    expect(val(at, '13')).toBe(Math.round(litresOf(tankFull)));
+    expect(logs[1]).toMatch(/12566 L of 12566 L$/);
+  });
+
+  it('the level stops at the underside of the cover', () => {
+    const p = steel();
+    p.sensors[0].deadBand = 0;
+    const eps = run(model(p), 2);
+    expect(val(eps, '11')).toBe(4000 + 5 + 600 - 10);
+    expect(val(eps, '13')).toBe(Math.round(litresOf(tankFull + neckArea * 595)));
+  });
+
+  it('a sensor hanging below the cover top, and a cover height given above level zero', () => {
+    const p = onManhole(tankProject('Tank M', 4000, []), { diameter: 600, heightBy: 'zero', top: 4405, cover: 10 }, { nozzle: -10 });
+    const m = model(p);
+    expect(m.entries[0].manhole).toMatchObject({ roofHeight: 4000, roofThickness: 5, neckHeight: 400, coverThickness: 10, sensorAboveCover: -10 });
+    expect(m.entries[0].sensorHeight).toBe(4395);
+    expect(val(run(m, 1395), '11')).toBe(3000);
+  });
+
+  it('a rectangular manhole in the slab over a concrete storage', () => {
+    const p = emptyProject();
+    p.name = 'Covered storage';
+    p.tank = { ...p.tank, kind: 'pit', pit: { ...defaultPit(), outline: rectangle(10000, 6000), wallHeight: 3000, heightRef: 'floorHigh', floor: { type: 'plane', direction: 0, drop: 200 } } };
+    onManhole(p, { shape: 'rect', diameter: 800, length: 600, x: 1000, y: 500, neck: 450, cover: 50 });
+    const d = derive(p);
+    expect(d.kind).toBe('pit');
+    expect(d.manholes[0].ok).toBe(true);
+    expect(d.manholes[0].coverHeight).toBe(3200 + 450);
+    expect(d.geoms[0].ok).toBe(true);
+    expect(d.geoms[0].manhole).toBe(d.manholes[0]);
+    expect(d.geoms[0].faceLevel).toBe(3650);
+    const m = model(p);
+    const e = m.entries[0];
+    expect(e.shape).toBe('concretePit');
+    expect(e.manhole).toEqual({ name: 'MH-1', shape: 'rectangular', insideWidth: 800, insideLength: 600, roofHeight: 3200, roofThickness: 0, neckHeight: 450, coverThickness: 50, sensorAboveCover: 0 });
+    expect(e.sensorHeight).toBe(3650);
+    const near = (got: number | undefined, want: number) => expect(Math.abs(got! - want)).toBeLessThan(0.5 + 0.06 + 2e-5 * d.totalL);
+    let eps = run(m, 650);
+    expect(val(eps, '11')).toBe(3000);
+    near(val(eps, '13'), d.engine.litres(3000));
+    // 200 mm up the neck: the storage is full, plus 800 × 600 × 200 mm.
+    eps = run(m, 250);
+    expect(val(eps, '11')).toBe(3400);
+    expect(val(eps, '12')).toBe(100);
+    near(val(eps, '13'), d.totalL + (800 * 600 * 200) / 1e6);
+    // Up to the underside of the cover, 400 mm above the wall top.
+    p.sensors[0].deadBand = 0;
+    eps = run(model(p), 1);
+    expect(val(eps, '11')).toBe(3600);
+    near(val(eps, '13'), d.totalL + (800 * 600 * 400) / 1e6);
+  });
+
+  it('on a domed roof the neck starts at the roof under the manhole, below the top of the dome', () => {
+    const p = tankProject('Dome', 3000, []);
+    p.tank.end = { ...defaultHead('ellipsoidal', 5) };
+    onManhole(p, { x: 700, diameter: 500, neck: 700, cover: 10 }, { deadBand: 0 });
+    const d = derive(p);
+    const g = d.geoms[0];
+    const mg = d.manholes[0];
+    const m = model(p);
+    const e = m.entries[0];
+    const mh = e.manhole as Record<string, number>;
+    expect(e.shape).toBe('standing cylinder');
+    expect(mh.roofHeight).toBeCloseTo(mg.roofLevel, 2);
+    expect(mh.roofHeight).toBeLessThan(d.depth - 50);
+    expect(mh.roofThickness).toBeGreaterThan(5);
+    expect(e.sensorHeight).toBeCloseTo(g.faceHeightUntilted, 1);
+    expect(Math.abs(e.levelOffset)).toBeLessThan(0.05);
+    // Between the roof at the manhole and the top of the dome: the dome is still filling, and the neck too.
+    const level = Math.round((mh.roofHeight + d.depth) / 2);
+    const eps = run(m, Math.round((e.sensorHeight + e.levelOffset - level) * 10) / 10);
+    const got = val(eps, '11')!;
+    expect(Math.abs(got - level)).toBeLessThanOrEqual(1);
+    const lv = e.sensorHeight + e.levelOffset - Math.round((e.sensorHeight + e.levelOffset - level) * 10) / 10;
+    const want = litresOf(d.engine.volume(lv)) + (Math.PI * 250 * 250 * (lv - mh.roofHeight)) / 1e6;
+    expect(Math.abs(val(eps, '13')! - want)).toBeLessThan(0.5 + 0.06 + 2e-5 * d.totalL);
+    // Above the dome: the whole tank, plus the neck up to that level.
+    const high = Math.round(d.depth + 100);
+    const eps2 = run(m, Math.round(e.sensorHeight + e.levelOffset - high));
+    expect(val(eps2, '11')).toBe(high);
+    const want2 = d.totalL + (Math.PI * 250 * 250 * (high - mh.roofHeight)) / 1e6;
+    expect(Math.abs(val(eps2, '13')! - want2)).toBeLessThan(0.5 + 0.06 + 2e-5 * d.totalL);
+  });
+
+  it('a tilted tank: the level follows the tilted sensor and the neck column is measured along the neck', () => {
+    const p = tankProject('Tilted', 4000, []);
+    p.tank.tilt = 4;
+    onManhole(p, { x: -300, diameter: 600, neck: 800, cover: 10 }, { deadBand: 0 });
+    const d = derive(p);
+    const g = d.geoms[0];
+    const mg = d.manholes[0];
+    const m = model(p);
+    const e = m.entries[0];
+    const mh = e.manhole as Record<string, number>;
+    expect(e.shape).toBe('table');
+    expect(mh.tilt).toBeCloseTo(4, 3);
+    expect(mh.roofHeight).toBeCloseTo(mg.roofLevel, 2);
+    for (const distance of [500, 1500, 3000]) {
+      const eps = run(m, distance);
+      expect(Math.abs(val(eps, '11')! - Math.min(levelFromMeasure(g, distance, d.density), d.depth + 1e9))).toBeLessThanOrEqual(0.52);
+    }
+    // 300 mm (in level) above the inside roof under the manhole.
+    const level = mg.roofLevel + 300;
+    const distance = (g.faceLevel - level) / g.cosTilt;
+    const eps = run(m, Math.round(distance * 10) / 10);
+    const lv = levelFromMeasure(g, Math.round(distance * 10) / 10, d.density);
+    const want = litresOf(d.engine.volume(Math.min(lv, d.depth))) + (Math.PI * 300 * 300 * ((lv - mg.roofLevel) / g.cosTilt)) / 1e6;
+    expect(Math.abs(val(eps, '13')! - want)).toBeLessThan(0.5 + 0.06 + 2e-4 * d.totalL);
+    expect((Math.PI * 300 * 300 * 300) / g.cosTilt / 1e6).toBeGreaterThan(84);
+  });
+
+  it('a site without a sensor on a manhole keeps the plain script', () => {
+    const p = tankProject('Plain', 4000, [top('radar', 'LT-1')]);
+    p.tank.manholes = [defaultManhole('MH-1')];
+    const m = model(p);
+    expect(m.entries[0].manhole).toBeNull();
+    const payload = cloudStudioPayload(m);
+    expect(payload).not.toContain('neckVolume');
+    expect(payload).toContain('var level = tank.sensorHeight - distance');
+    expect(load(payload).TANKS![1].sensorHeight).toBe(4005);
+  });
+
+  it('two sensors of one site: one on a manhole, one on the roof', () => {
+    const a = steel();
+    const b = tankProject('Roof', 3000, [top('radar', 'LT-2')]);
+    const m = site([a, b], [{ address, number: 1 }, { address: 'A840410000000002', number: 2 }]);
+    const payload = load(cloudStudioPayload(m));
+    expect(payload.TANKS![1].manhole).toBeDefined();
+    expect(payload.TANKS![2]).toMatchObject({ sensorHeight: 3005 });
+    expect(payload.TANKS![2].manhole).toBeUndefined();
+    expect(val(send(m, 'A840410000000002', SEND.ttn(1005)), '21')).toBe(2000);
+    expect(val(send(m, address, SEND.ttn(405)), '13')).toBe(Math.round(litresOf(tankFull + neckArea * 200)));
   });
 });
 

@@ -11,7 +11,7 @@ import {
   type SensorGeom,
 } from '../core/sensors';
 import type { Project, SensorConfig } from '../core/types';
-import type { VolumeEngine } from '../core/volume';
+import type { LevelEngine } from '../core/volume';
 import {
   LENGTH,
   MM3_TO_L,
@@ -118,7 +118,7 @@ export function rawInfo(s: SensorConfig): { label: string; unit: string; toMeasu
  * Raw → level formula for a sensor. With an engine, the sensor's field
  * calibration is applied (when it has enough points).
  */
-export function conversionFor(g: SensorGeom, density: number, ident: string, engine?: VolumeEngine): Conversion {
+export function conversionFor(g: SensorGeom, density: number, ident: string, engine?: LevelEngine): Conversion {
   const s = g.sensor;
   const info = rawInfo(s);
   const lv = (raw: number) => levelFromMeasure(g, info.toMeasure(raw), density);

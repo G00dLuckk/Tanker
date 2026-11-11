@@ -34,7 +34,8 @@ interface Part {
 }
 
 export interface TankGeometry {
-  outline: Outline;
+  /** Section outline of a tank; null for a concrete storage (its surface is built from the plan). */
+  outline: Outline | null;
   inner: THREE.BufferGeometry;
   water: THREE.BufferGeometry;
   outer: THREE.BufferGeometry;

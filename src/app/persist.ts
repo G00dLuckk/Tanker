@@ -1,6 +1,7 @@
 import { defaultCal, defaultCloud, defaultHead, defaultIot, defaultManhole, defaultSensor, defaultSim, defaultView, emptyProject } from '../core/defaults';
+import { defaultPit } from '../core/pit';
 import { defaultProject } from '../core/presets';
-import type { CalConfig, CloudConfig, HeadConfig, ManholeConfig, ProfilePoint, Project, SensorConfig, SimState, SiteDevice, ViewState } from '../core/types';
+import type { CalConfig, CloudConfig, HeadConfig, ManholeConfig, PitCheck, PitConfig, PitFloor, PitSump, PlanPoint, ProfilePoint, Project, SensorConfig, SimState, SiteDevice, ViewState } from '../core/types';
 import type { AppState, ExportPrefs } from './store';
 
 const KEY = 'tanker-time/state/v1';
@@ -37,6 +38,7 @@ export function defaultExportPrefs(): ExportPrefs {
     lengthUnit: 'auto',
     volumeUnit: 'auto',
     csVarIds: {},
+    csFamily: 'auto',
   };
 }
 
@@ -60,10 +62,55 @@ function normalizeCloud(c: Partial<CloudConfig>): CloudConfig {
 export function normalizeExportPrefs(p: Partial<ExportPrefs> | null | undefined): ExportPrefs {
   const out = { ...defaultExportPrefs(), ...(p ?? {}) };
   // Older versions had more tabs (context, python, Cloud Studio config…).
-  const tabs: Record<string, ExportPrefs['tab']> = { config: 'config', csconfig: 'config', payload: 'payload', cspayload: 'payload', table: 'table', csv: 'table' };
+  const tabs: Record<string, ExportPrefs['tab']> = { config: 'config', csconfig: 'config', payload: 'payload', cspayload: 'payload', table: 'table', csv: 'table', details: 'details' };
   out.tab = tabs[out.tab as string] ?? 'config';
   out.csVarIds = out.csVarIds && typeof out.csVarIds === 'object' ? { ...out.csVarIds } : {};
+  if (out.csFamily !== 'lorawan' && out.csFamily !== 'tcp') out.csFamily = 'auto';
   return out;
+}
+
+/** A concrete storage as saved, with every field present and every number finite. */
+export function normalizePit(raw: Partial<PitConfig> | null | undefined): PitConfig {
+  const base = defaultPit();
+  if (!raw || typeof raw !== 'object') return base;
+  const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
+  const opt = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const pts = (list: unknown): PlanPoint[] =>
+    (Array.isArray(list) ? list : []).filter((q) => q && typeof q === 'object' && Number.isFinite(q.x) && Number.isFinite(q.y)).map((q) => ({ x: Number(q.x), y: Number(q.y) }));
+  const outline = pts(raw.outline);
+  const f = raw.floor as Partial<PitFloor> | undefined;
+  const floor: PitFloor =
+    f?.type === 'plane'
+      ? { type: 'plane', direction: num((f as { direction?: number }).direction, 0), drop: num((f as { drop?: number }).drop, 0) }
+      : f?.type === 'vertices'
+        ? { type: 'vertices', heights: (Array.isArray((f as { heights?: unknown }).heights) ? ((f as { heights: unknown[] }).heights as unknown[]) : []).map((h) => num(h, 0)) }
+        : { type: 'flat' };
+  const sumps: PitSump[] = (Array.isArray(raw.sumps) ? raw.sumps : [])
+    .filter((s) => s && typeof s === 'object')
+    .map((s) => {
+      const out: PitSump = { x: num(s.x, 0), y: num(s.y, 0), width: num(s.width, 1000), length: num(s.length, 1000), depth: num(s.depth, 300) };
+      const o = pts(s.outline);
+      if (o.length >= 3) out.outline = o;
+      return out;
+    });
+  const checks: PitCheck[] = (Array.isArray(raw.checks) ? raw.checks : [])
+    .filter((c) => c && typeof c === 'object')
+    .map((c) => ({ level: num(c.level, NaN), litres: num(c.litres, NaN) }));
+  return {
+    outline: outline.length >= 3 ? outline : base.outline,
+    wallHeight: num(raw.wallHeight, base.wallHeight),
+    heightRef: raw.heightRef === 'datum' || raw.heightRef === 'floorLow' || raw.heightRef === 'floorHigh' ? raw.heightRef : base.heightRef,
+    floor,
+    sumps,
+    batter: num(raw.batter, 0),
+    wallTop: num(raw.wallTop, base.wallTop),
+    wallBase: num(raw.wallBase, base.wallBase),
+    slab: num(raw.slab, base.slab),
+    operationLevel: opt(raw.operationLevel),
+    alarmHigh: opt(raw.alarmHigh),
+    alarmLow: opt(raw.alarmLow),
+    checks,
+  };
 }
 
 /** Fills in fields missing from older or hand-edited project files. */
@@ -88,6 +135,14 @@ export function normalizeProject(p: Partial<Project> | null | undefined): Projec
       .filter((mh) => mh && typeof mh === 'object')
       .map((mh, i): ManholeConfig => ({ ...defaultManhole(`MH-${i + 1}`), ...mh }));
   } else delete tank.manholes;
+  if (p.tank.kind === 'pit') {
+    tank.kind = 'pit';
+    tank.pit = normalizePit(p.tank.pit);
+  } else {
+    delete tank.kind;
+    if (p.tank.pit && typeof p.tank.pit === 'object') tank.pit = normalizePit(p.tank.pit);
+    else delete tank.pit;
+  }
   const sensors: SensorConfig[] = (Array.isArray(p.sensors) ? p.sensors : []).map((s, i) => {
     const kind = s && s.kind ? s.kind : 'ultrasonic';
     const c: Partial<CalConfig> = s?.cal ?? {};

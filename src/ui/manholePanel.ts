@@ -1,8 +1,9 @@
 import { defaultManhole, nextManholeTag } from '../core/defaults';
 import type { Derived } from '../core/derive';
-import { manholeHalf, verticalSpan } from '../core/sensors';
+import { centroid } from '../core/polygon';
+import { manholeHalf } from '../core/sensors';
 import type { ManholeConfig, SensorConfig, TankConfig } from '../core/types';
-import { fmtLen, type LengthUnit } from '../core/units';
+import { fmtLen, fmtVol, type LengthUnit } from '../core/units';
 import { h, icon } from './dom';
 import { FieldSet, lengthField, segmented, textField, type Field } from './fields';
 import type { PanelCtx } from './tankPanel';
@@ -17,21 +18,29 @@ export function newManhole(d: Derived, existing: ManholeConfig[], at?: { x: numb
   const mh = defaultManhole(nextManholeTag(existing));
   const m = d.model;
   // Opening about a quarter of the narrow side, between 300 and 600 mm, rounded to 50 mm.
-  const narrow = 2 * Math.min(m.base.A, m.base.B);
+  const narrow = d.kind === 'pit' ? Math.min(d.pit.box.x1 - d.pit.box.x0, d.pit.box.y1 - d.pit.box.y0) : 2 * Math.min(m.base.A, m.base.B);
+  // In the slab over a storage: 450 mm from the wall top to the cover top (slab + frame) to start with.
+  if (d.kind === 'pit') mh.neck = 450;
   mh.diameter = Math.min(600, Math.max(300, Math.round((0.25 * narrow) / 50) * 50));
   mh.length = mh.diameter;
   if (at) {
     mh.x = Math.round(at.x);
     mh.y = Math.round(at.y);
   } else {
-    const spots: [number, number][] =
+    let spots: [number, number][] =
       m.orientation === 'vertical'
         ? [[0, 0], [0.4 * m.base.A, 0], [-0.4 * m.base.A, 0], [0, 0.4 * m.base.B], [0, -0.4 * m.base.B]]
         : [[0, 0], [0.3 * m.L, 0], [-0.3 * m.L, 0], [0.15 * m.L, 0], [-0.15 * m.L, 0]];
+    if (d.kind === 'pit') {
+      // The middle of the storage, then points halfway from the middle to each corner.
+      const o = d.pit.outline;
+      const c = centroid(o);
+      spots = [[c.x, c.y], ...o.map((q): [number, number] => [(q.x + c.x) / 2, (q.y + c.y) / 2])];
+    }
     let best = spots[0];
     let bestD = -1;
     for (const p of spots) {
-      if (!verticalSpan(m, p[0], p[1])) continue;
+      if (!d.hull.span(p[0], p[1])) continue;
       const dmin = existing.length ? Math.min(...existing.map((e) => Math.hypot(e.x - p[0], e.y - p[1]))) : Infinity;
       if (dmin > bestD + 1e-6) {
         bestD = dmin;
@@ -133,7 +142,8 @@ function manholeCard(ctx: PanelCtx, fs: FieldSet, m0: ManholeConfig, select: (id
 
   if (!selected) return card;
 
-  const vert = st.project.tank.orientation === 'vertical';
+  const pit = ctx.derived().kind === 'pit';
+  const vert = pit || st.project.tank.orientation === 'vertical';
   const items: Field[] = [
     textField(ctx, { id: fid('tag'), label: 'Tag', get: () => M().tag, set: (v) => (M().tag = v), change: ['sensors'], maxLength: 16 }),
     segmented(ctx, {
@@ -175,7 +185,7 @@ function manholeCard(ctx: PanelCtx, fs: FieldSet, m0: ManholeConfig, select: (id
       id: fid('hby'),
       label: 'Cover height given as',
       options: [
-        { value: 'neck', label: 'Neck above roof' },
+        { value: 'neck', label: pit ? 'Above the wall top' : 'Neck above roof' },
         { value: 'zero', label: 'Above level zero' },
       ],
       get: () => M().heightBy,
@@ -196,8 +206,10 @@ function manholeCard(ctx: PanelCtx, fs: FieldSet, m0: ManholeConfig, select: (id
     items.push(
       lengthField(ctx, {
         id: fid('neck'),
-        label: 'Neck height (roof to cover top)',
-        hint: 'From the outside of the roof at the manhole centre up to the top of the closed cover.',
+        label: pit ? 'Cover top above the wall top' : 'Neck height (roof to cover top)',
+        hint: pit
+          ? 'From the top of the wall (the underside of the slab that covers the storage) up to the top of the closed cover: slab thickness + frame.'
+          : 'From the outside of the roof at the manhole centre up to the top of the closed cover.',
         min: 0,
         get: () => M().neck,
         set: (v) => (M().neck = v),
@@ -219,7 +231,7 @@ function manholeCard(ctx: PanelCtx, fs: FieldSet, m0: ManholeConfig, select: (id
         change: ['sensors'],
         note: () => {
           const g = ctx.derived().manholes.find((x) => x.manhole.id === id);
-          return g?.ok ? `Neck ${fmtLen(g.neckHeight, u())} above the roof` : '';
+          return g?.ok ? (pit ? `${fmtLen(g.neckHeight, u())} above the wall top` : `Neck ${fmtLen(g.neckHeight, u())} above the roof`) : '';
         },
       }),
     );
@@ -240,9 +252,10 @@ function manholeCard(ctx: PanelCtx, fs: FieldSet, m0: ManholeConfig, select: (id
       const [hx, hy] = manholeHalf(g.manhole);
       const rows: [string, string][] = [
         ['Cover top above level zero', fmtLen(g.coverHeight, u())],
-        ['Neck above the roof', fmtLen(g.neckHeight, u())],
-        ['Inside roof at the centre', fmtLen(g.roofLevel, u())],
+        [pit ? 'Cover top above the wall top' : 'Neck above the roof', fmtLen(g.neckHeight, u())],
+        [pit ? 'Wall top (underside of the slab)' : 'Inside roof at the centre', fmtLen(g.roofLevel, u())],
         ['Clear opening', g.manhole.shape === 'round' ? `Ø ${fmtLen(2 * hx, u())}` : `${fmtLen(2 * hx, u(), false)} × ${fmtLen(2 * hy, u())}`],
+        ['Liquid can stand in the neck', `${fmtLen(g.neckDepth, u())} high · ${fmtVol((g.area * g.neckDepth) / 1e6, st.project.units.volume)}`],
       ];
       const tags = onIt().map((s) => s.tag);
       rows.push(['Sensors on the cover', tags.length ? tags.join(', ') : 'none']);

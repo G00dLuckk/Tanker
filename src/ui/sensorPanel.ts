@@ -1,7 +1,9 @@
 import { sensorColor } from '../app/colors';
 import { SENSOR_KINDS, defaultSensor, isPressureSensor, isTopSensor, nextColorSlot, nextTag } from '../core/defaults';
 import type { Derived } from '../core/derive';
-import { STATUS_TEXT, digitalFactor, verticalSpan } from '../core/sensors';
+import { shallowestPoint } from '../core/pit';
+import { centroid } from '../core/polygon';
+import { STATUS_TEXT, digitalFactor } from '../core/sensors';
 import type { SensorConfig, SensorKind } from '../core/types';
 import { G, LENGTH, PRESSURE, fmtLen, fmtVol, plain, type LengthUnit } from '../core/units';
 import { h, icon } from './dom';
@@ -37,15 +39,23 @@ export function newSensor(kind: SensorKind, d: Derived, existing: SensorConfig[]
   const A = m.base.A;
   const B = m.base.B;
   // Candidate spots across the plan; take the one farthest from sensors already there.
-  const spots: [number, number][] =
+  let spots: [number, number][] =
     m.orientation === 'vertical'
       ? [[0, 0], [0.45 * A, 0], [-0.45 * A, 0], [0, 0.45 * B], [0, -0.45 * B], [0.32 * A, 0.32 * B], [-0.32 * A, -0.32 * B], [-0.32 * A, 0.32 * B], [0.32 * A, -0.32 * B]]
       : [[0, 0], [0.3 * m.L, 0], [-0.3 * m.L, 0], [0.15 * m.L, 0], [-0.15 * m.L, 0], [0.45 * m.L, 0], [-0.45 * m.L, 0]];
+  if (d.kind === 'pit') {
+    // Near the walls, where a bracket would be, starting at the shallowest corner (shortest empty distance).
+    const o = d.pit.outline;
+    const c = centroid(o);
+    const inward = (x: number, y: number, f: number): [number, number] => [x + (c.x - x) * f, y + (c.y - y) * f];
+    const sh = shallowestPoint(d.pit);
+    spots = [inward(sh.x, sh.y, 0.12), ...o.map((q, i) => inward((q.x + o[(i + 1) % o.length].x) / 2, (q.y + o[(i + 1) % o.length].y) / 2, 0.08)), [c.x, c.y]];
+  }
   const pick = () => {
     let best = spots[0];
     let bestD = -1;
     for (const p of spots) {
-      if (!verticalSpan(m, p[0], p[1])) continue;
+      if (!d.hull.span(p[0], p[1])) continue;
       const dmin = existing.length ? Math.min(...existing.map((e) => Math.hypot(e.x - p[0], e.y - p[1]))) : Infinity;
       if (dmin > bestD + 1e-6) {
         bestD = dmin;
@@ -56,7 +66,9 @@ export function newSensor(kind: SensorKind, d: Derived, existing: SensorConfig[]
   };
   if (isTopSensor(kind)) {
     [s.x, s.y] = pick().map((v) => Math.round(v)) as [number, number];
-    // On a tank with manholes, a new top sensor goes on the first cover that has no sensor yet.
+    // On a storage the sensor sits on a bracket on the wall top, clear of its dead band.
+    if (d.kind === 'pit') s.nozzle = Math.max(250, Math.ceil(s.deadBand / 50) * 50);
+    // With manholes, a new top sensor goes on the first cover that has no sensor yet.
     const free = d.manholes.find((mg) => mg.ok && !existing.some((e) => e.faceMode === 'manhole' && e.manhole === mg.manhole.id));
     if (free) {
       s.faceMode = 'manhole';
@@ -99,6 +111,7 @@ function changeKind(s: SensorConfig, kind: SensorKind, d: Derived): void {
 export function buildSensorPanel(ctx: PanelCtx, fs: FieldSet, open: Set<string>, plan: PlanView, select: (id: string | null) => void): HTMLElement {
   const st = ctx.store;
   const sensors = st.project.sensors;
+  const pit = ctx.derived().kind === 'pit';
 
   const add = (kind: SensorKind) => {
     const s = newSensor(kind, ctx.derived(), st.project.sensors);
@@ -122,7 +135,12 @@ export function buildSensorPanel(ctx: PanelCtx, fs: FieldSet, open: Set<string>,
       h('button', { type: 'button', class: 'btn btn-quiet', on: { click: () => add('ultrasonic') } }, icon('plus', 16), 'Top'),
       h('button', { type: 'button', class: 'btn btn-quiet', on: { click: () => add('pressure') } }, icon('plus', 16), 'Bottom'),
       h('button', { type: 'button', class: 'btn btn-quiet', on: { click: () => add('switch') } }, icon('plus', 16), 'Switch'),
-      h('button', { type: 'button', class: 'btn btn-quiet', title: 'Add a manhole (hole door) on the roof', on: { click: addManhole } }, icon('plus', 16), 'Manhole'),
+      h(
+        'button',
+        { type: 'button', class: 'btn btn-quiet', title: pit ? 'Add a manhole (hole door) in the slab that covers the storage' : 'Add a manhole (hole door) on the roof', on: { click: addManhole } },
+        icon('plus', 16),
+        'Manhole',
+      ),
     ]),
   );
 
@@ -130,7 +148,7 @@ export function buildSensorPanel(ctx: PanelCtx, fs: FieldSet, open: Set<string>,
   const mhCards = manholeCards(ctx, fs, select);
   const empty = sensors.length
     ? null
-    : h('p', { class: 'empty-note' }, 'No sensors yet. Add a top sensor (ultrasonic, radar, laser) or a bottom pressure sensor, then drag it in the top view.');
+    : h('p', { class: 'empty-note' }, pit ? 'No sensors yet. Add a top sensor (ultrasonic, radar, laser) on a bracket on the wall top, then drag it in the top view.' : 'No sensors yet. Add a top sensor (ultrasonic, radar, laser) or a bottom pressure sensor, then drag it in the top view.');
 
   const sum = h('span', { class: 'section-sum' });
   const det = h(
@@ -143,10 +161,14 @@ export function buildSensorPanel(ctx: PanelCtx, fs: FieldSet, open: Set<string>,
       explain(
         'Which sensor type to choose',
         [
-          'Top (ultrasonic, radar, laser): mounted on the roof, measures the distance down to the liquid. Level = face height − distance. It cannot measure close to its face (dead band) or below the floor right under it.',
+          pit
+            ? 'Top (ultrasonic, radar, laser): on a bracket on the wall top, measures the distance down to the liquid. Level = face height − distance. It cannot measure close to its face (dead band) or below the floor right under it, so put it over the shallow part of the floor and give the bracket at least the dead band in height.'
+            : 'Top (ultrasonic, radar, laser): mounted on the roof, measures the distance down to the liquid. Level = face height − distance. It cannot measure close to its face (dead band) or below the floor right under it.',
           'Bottom (pressure): mounted at or near the floor, measures the weight of the liquid above it. Level = sensing point + pressure ÷ (density × g). 1 m of water ≈ 9.8 kPa ≈ 98 mbar.',
           'Switch: a float or point switch that only says wet or dry at one height. Use it for high or low alarms.',
-          'Manhole: the hole door on the roof. If a top sensor sits on the manhole cover, add the manhole, set its neck height, then choose "On a manhole" in the sensor. The sensor face is then the cover top + the sensor height above it.',
+          pit
+            ? 'Manhole: the hole door in the slab that covers the storage. If a top sensor sits on the manhole cover, add the manhole with its own opening size, set how high its cover is above the wall top (slab + frame), then choose "On a manhole" in the sensor. The sensor face is then the cover top + the sensor height above it.'
+            : 'Manhole: the hole door on the roof. If a top sensor sits on the manhole cover, add the manhole, set its neck height, then choose "On a manhole" in the sensor. The sensor face is then the cover top + the sensor height above it.',
         ],
         'Drag a sensor in the top view below, or type its X / Y position. Click a sensor card to open its settings and its calibration.',
       ),
@@ -274,7 +296,8 @@ function sensorCard(ctx: PanelCtx, fs: FieldSet, s0: SensorConfig, select: (id: 
       change: ['sensors', 'structure'],
     }),
   );
-  const vert = st.project.tank.orientation === 'vertical';
+  const pit = ctx.derived().kind === 'pit';
+  const vert = pit || st.project.tank.orientation === 'vertical';
   items.push(
     lengthField(ctx, { id: fid('x'), label: vert ? 'Position X (left–right)' : 'Position X (along length)', get: () => S().x, set: (v) => (S().x = v), change: ['sensors'] }),
     lengthField(ctx, { id: fid('y'), label: vert ? 'Position Y (front–back)' : 'Position Y (across)', get: () => S().y, set: (v) => (S().y = v), change: ['sensors'] }),
@@ -285,11 +308,17 @@ function sensorCard(ctx: PanelCtx, fs: FieldSet, s0: SensorConfig, select: (id: 
       segmented(ctx, {
         id: fid('facemode'),
         label: 'Sensor face height',
-        options: [
-          { value: 'auto', label: 'On the roof' },
-          { value: 'manhole', label: 'On a manhole' },
-          { value: 'manual', label: 'Type it in' },
-        ],
+        options: pit
+          ? [
+              { value: 'auto', label: 'On the wall top' },
+              { value: 'manhole', label: 'On a manhole' },
+              { value: 'manual', label: 'Type it in' },
+            ]
+          : [
+              { value: 'auto', label: 'On the roof' },
+              { value: 'manhole', label: 'On a manhole' },
+              { value: 'manual', label: 'Type it in' },
+            ],
         get: () => S().faceMode,
         set: (v) => {
           const s = S();
@@ -359,20 +388,21 @@ function sensorCard(ctx: PanelCtx, fs: FieldSet, s0: SensorConfig, select: (id: 
       items.push(
         lengthField(ctx, {
           id: fid('nozzle'),
-          label: 'Nozzle / stand-off',
+          label: pit ? 'Bracket: face above the wall top' : 'Nozzle / stand-off',
+          hint: pit ? 'Height of the sensor face above the top of the wall it is fixed to. Give it at least the dead band, or a full storage cannot be measured.' : undefined,
           min: -5000,
           get: () => S().nozzle,
           set: (v) => (S().nozzle = v),
           change: ['sensors'],
           note: () => {
             const g = ctx.derived().geoms.find((x) => x.sensor.id === id);
-            return g?.ok ? `Face ${fmtLen(g.faceLevel, u())} above level zero` : '';
+            return g?.ok ? `Face ${fmtLen(g.faceLevel, u())} above level zero${pit ? ` · ${fmtLen(g.floorDist, u())} to the floor under it` : ''}` : '';
           },
         }),
       );
     } else {
       items.push(
-        lengthField(ctx, { id: fid('face'), label: 'Face above level zero', min: 0, get: () => S().faceHeight, set: (v) => (S().faceHeight = v), change: ['sensors'] }),
+        lengthField(ctx, { id: fid('face'), label: pit ? 'Face above the deepest point (level zero)' : 'Face above level zero', min: 0, get: () => S().faceHeight, set: (v) => (S().faceHeight = v), change: ['sensors'] }),
       );
     }
     items.push(
@@ -565,6 +595,7 @@ function sensorCard(ctx: PanelCtx, fs: FieldSet, s0: SensorConfig, select: (id: 
       if (g.mount === 'top') {
         if (g.manhole) rows.push([`${g.manhole.manhole.tag} cover top`, fmtLen(g.manhole.coverHeight, u())]);
         rows.push(['Face above level zero', fmtLen(g.faceLevel, u())], ['Floor below sensor', fmtLen(g.floorLevel, u())]);
+        if (dd.kind === 'pit') rows.push(['Reads when empty', fmtLen(g.floorDist, u())]);
       } else {
         rows.push(['Sensing point', fmtLen(g.faceLevel, u())]);
       }
@@ -590,12 +621,20 @@ function sensorCard(ctx: PanelCtx, fs: FieldSet, s0: SensorConfig, select: (id: 
   const placeHelp = top
     ? explain(
         'Face height, dead band and range',
-        [
-          'Face height: where the sensor measures from. On the roof it is the roof height at this position + roof plate + nozzle. A domed or cone roof is higher in the middle than at the edge.',
-          'On a manhole: the face is the top of the manhole cover + the sensor height above it. Set the manhole neck height (roof to cover top) in its card, or its cover height above level zero.',
-          'Dead band: the sensor cannot see liquid closer than this to its face (typical 150–300 mm for ultrasonic, 50–100 mm for radar). The top of the tank above that cannot be measured.',
-          'Max range: the farthest it can measure. Beam angle: the width of the cone; a wide beam close to a wall can give false echoes.',
-        ],
+        pit
+          ? [
+              'Face height: where the sensor measures from. On the wall top it is the wall height + the bracket height; or type the face height above the deepest point of the floor.',
+              'On a manhole: for a storage with a slab on top. The face is the top of the manhole cover + the sensor height above it. Set in the manhole card how high the cover is above the wall top (slab thickness + frame).',
+              'Empty storage: the sensor reads the distance to the floor under it. The floor is higher at the shallow end, so a sensor there needs less range. The card below shows that distance; keep it inside the sensor range (4 m for a TEK 766, 3 m with a waveguide).',
+              'Dead band: the sensor cannot see liquid closer than this to its face (about 220 mm for a TEK 766). Make the bracket at least that high, or a full storage reads wrong.',
+              'Max range: the farthest it can measure. Beam angle: the width of the cone; a wide beam close to a wall can give false echoes.',
+            ]
+          : [
+              'Face height: where the sensor measures from. On the roof it is the roof height at this position + roof plate + nozzle. A domed or cone roof is higher in the middle than at the edge.',
+              'On a manhole: the face is the top of the manhole cover + the sensor height above it. Set the manhole neck height (roof to cover top) in its card, or its cover height above level zero.',
+              'Dead band: the sensor cannot see liquid closer than this to its face (typical 150–300 mm for ultrasonic, 50–100 mm for radar). The top of the tank above that cannot be measured.',
+              'Max range: the farthest it can measure. Beam angle: the width of the cone; a wide beam close to a wall can give false echoes.',
+            ],
       )
     : pressure
       ? explain(

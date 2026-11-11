@@ -1,6 +1,6 @@
 import type { CalConfig, CalMethod } from './types';
 import { MM3_TO_L } from './units';
-import type { VolumeEngine } from './volume';
+import type { LevelEngine } from './volume';
 
 /**
  * Field calibration. The drawing gives a straight-line formula
@@ -89,7 +89,7 @@ export interface CalFit {
 }
 
 /** Reference value → true level (mm), or NaN if it is outside the tank. */
-export function refToLevel(cal: CalConfig, ref: number, engine: VolumeEngine): number {
+export function refToLevel(cal: CalConfig, ref: number, engine: LevelEngine): number {
   if (!Number.isFinite(ref)) return NaN;
   if (cal.ref === 'level') return ref >= -1e-9 && ref <= engine.depth + 1e-9 ? ref : NaN;
   const mm3 = ref / MM3_TO_L;
@@ -101,7 +101,7 @@ export function fitCalibration(
   cal: CalConfig,
   A: number,
   B: number,
-  engine: VolumeEngine,
+  engine: LevelEngine,
   validMin: number,
   validMax: number,
 ): CalFit {

@@ -1,9 +1,50 @@
 import { isPressureSensor, SENSOR_KINDS } from './defaults';
 import { chordRange } from './shape';
 import type { Sec, TankModel } from './tank';
-import type { ManholeConfig, SensorConfig } from './types';
+import type { ManholeConfig, Orientation, SensorConfig } from './types';
 import { G, LENGTH, PRESSURE, clamp, isLengthUnit, isPressureUnit } from './units';
-import type { VolumeEngine } from './volume';
+import type { LevelEngine } from './volume';
+
+/**
+ * What sensor placement needs to know about the thing that holds the liquid: a closed
+ * tank (its TankModel) or an open concrete storage. Plan positions are X / Y as the
+ * user types them; "up" is the untilted vertical in the tank frame.
+ */
+export interface Hull {
+  orientation: Orientation;
+  /** Characteristic size for tolerances (mm). */
+  size: number;
+  /** Lowest inside point along up (untilted level zero). */
+  zero: number;
+  /** Horizontal tanks: straight shell length, for the plan → tank-frame mapping. */
+  L: number;
+  /** Open at the top (a storage without a roof): top sensors sit on the wall top with a bracket. */
+  open: boolean;
+  /** Lowest and highest inside point along up at a plan position, or null outside. */
+  span(x: number, y: number): { lo: number; hi: number } | null;
+  /** Thickness of the roof (plate) above the inside roof point; 0 for an open storage. */
+  roofThickness(x: number, y: number, roofUp: number): number;
+  /** Tank-frame point inside the liquid space. */
+  inside(a: number, u: number, v: number): boolean;
+}
+
+export function isHull(x: TankModel | Hull): x is Hull {
+  return typeof (x as Hull).span === 'function';
+}
+
+/** The hull of a closed tank. */
+export function tankHull(model: TankModel): Hull {
+  return {
+    orientation: model.orientation,
+    size: model.size,
+    zero: upZero(model),
+    L: model.L,
+    open: false,
+    span: (x, y) => verticalSpan(model, x, y),
+    roofThickness: (x, y, roofUp) => roofThickness(model, x, y, roofUp),
+    inside: (a, u, v) => model.inside(a, u, v),
+  };
+}
 
 /** Tank-frame point (a, u, v). */
 export type Vec3 = [number, number, number];
@@ -87,6 +128,12 @@ export interface ManholeGeom {
   coverLevel: number;
   /** Inside roof above level zero at the centre (mm, includes tilt). */
   roofLevel: number;
+  /** Roof plate at the centre, measured straight up (mm); 0 on a concrete storage. */
+  roofThickness: number;
+  /** Underside of the cover above the inside roof at the centre (mm): how high liquid can stand in the neck. */
+  neckDepth: number;
+  /** Clear area of the opening (mm²). */
+  area: number;
 }
 
 /** Half sizes of a manhole opening along X and Y (mm). */
@@ -132,8 +179,13 @@ export function manholeClearance(mh: ManholeConfig, x: number, y: number): numbe
   return Math.min(hx - Math.abs(dx), hy - Math.abs(dy));
 }
 
-export function manholeGeometry(mh: ManholeConfig, model: TankModel, engine: VolumeEngine): ManholeGeom {
-  const zero = upZero(model);
+/**
+ * A manhole on the roof of a tank, or on the slab that covers a concrete storage (there the
+ * "roof" is the wall top, and the neck height counts from it: slab + frame).
+ */
+export function manholeGeometry(mh: ManholeConfig, hullOrModel: TankModel | Hull, engine: LevelEngine): ManholeGeom {
+  const model = isHull(hullOrModel) ? hullOrModel : tankHull(hullOrModel);
+  const zero = model.zero;
   const warnings: string[] = [];
   const g: ManholeGeom = {
     manhole: mh,
@@ -148,38 +200,44 @@ export function manholeGeometry(mh: ManholeConfig, model: TankModel, engine: Vol
     coverHeight: 0,
     coverLevel: 0,
     roofLevel: 0,
+    roofThickness: 0,
+    neckDepth: 0,
+    area: 0,
   };
   const [hx, hy] = manholeHalf(mh);
   if (!(hx > 0) || !(hy > 0)) {
     g.error = 'The opening size must be more than zero.';
     return g;
   }
-  const span = verticalSpan(model, mh.x, mh.y);
+  g.area = mh.shape === 'round' ? Math.PI * hx * hx : 4 * hx * hy;
+  const span = model.span(mh.x, mh.y);
   if (!span) {
-    g.error = 'The centre is outside the tank. Move the manhole inside the outline.';
+    g.error = model.open ? 'The centre is outside the storage. Move the manhole inside the inner wall faces.' : 'The centre is outside the tank. Move the manhole inside the outline.';
     return g;
   }
-  const t = roofThickness(model, mh.x, mh.y, span.hi);
+  const t = model.roofThickness(mh.x, mh.y, span.hi);
+  g.roofThickness = t;
   g.roofUp = span.hi;
   g.roofOuterUp = span.hi + t;
   let lowest = span.hi;
   let outside = 0;
   for (const [ex, ey] of manholeEdge(mh)) {
-    const e = verticalSpan(model, ex, ey);
+    const e = model.span(ex, ey);
     if (e) lowest = Math.min(lowest, e.hi);
     else outside++;
   }
   g.baseUp = lowest + t;
-  if (outside) warnings.push('The opening runs past the edge of the roof: it is wider than the roof at this position.');
+  if (outside) warnings.push(model.open ? 'The opening runs past the inner wall face: part of it is over the wall.' : 'The opening runs past the edge of the roof: it is wider than the roof at this position.');
   g.coverUp = mh.heightBy === 'zero' ? zero + mh.top : g.roofOuterUp + mh.neck;
   g.neckHeight = g.coverUp - g.roofOuterUp;
   if (g.neckHeight < -1e-6) {
-    g.error = 'The top of the cover is below the roof at the manhole centre.';
+    g.error = model.open ? 'The top of the cover is below the wall top.' : 'The top of the cover is below the roof at the manhole centre.';
     return g;
   }
   if (mh.cover > g.neckHeight + 1e-6) {
-    warnings.push('The cover is thicker than the neck is high: the top of the cover should be at least one cover thickness above the roof.');
+    warnings.push(`The cover is thicker than the neck is high: the top of the cover should be at least one cover thickness above the ${model.open ? 'wall top' : 'roof'}.`);
   }
+  g.neckDepth = Math.max(0, g.coverUp - Math.max(0, mh.cover) - g.roofUp);
   const levelOf = (up: number) => {
     const p = planToTank(model, mh.x, mh.y, up);
     return engine.levelOfPoint(p[0], p[1], p[2]);
@@ -210,16 +268,16 @@ export interface Reading {
 
 const tmpSec: Sec = { ku: 0, kv: 0, cu: 0, cv: 0 };
 
-export function upVector(model: TankModel): Vec3 {
+export function upVector(model: TankModel | Hull): Vec3 {
   return model.orientation === 'vertical' ? [1, 0, 0] : [0, 0, 1];
 }
 
 /** Converts a plan position to the tank-frame coordinates across the up axis. */
-export function planToTank(model: TankModel, x: number, y: number, up: number): Vec3 {
+export function planToTank(model: TankModel | Hull, x: number, y: number, up: number): Vec3 {
   return model.orientation === 'vertical' ? [up, x, y] : [x + model.L / 2, y, up];
 }
 
-export function upOf(model: TankModel, p: Vec3): number {
+export function upOf(model: TankModel | Hull, p: Vec3): number {
   return model.orientation === 'vertical' ? p[0] : p[2];
 }
 
@@ -301,18 +359,20 @@ function roofThickness(model: TankModel, x: number, y: number, roofUp: number): 
 
 export function sensorGeometry(
   sensor: SensorConfig,
-  model: TankModel,
-  engine: VolumeEngine,
+  hullOrModel: TankModel | Hull,
+  engine: LevelEngine,
   density: number,
   manholes: ManholeGeom[] = [],
 ): SensorGeom {
+  const model = isHull(hullOrModel) ? hullOrModel : tankHull(hullOrModel);
   const mount = SENSOR_KINDS[sensor.kind].mount;
   const up = upVector(model);
   const cosTilt = engine.axis === -1 ? 1 : model.orientation === 'vertical' ? engine.na : engine.nw;
   const warnings: string[] = [];
-  const zero = upZero(model);
-  const span = verticalSpan(model, sensor.x, sensor.y);
+  const zero = model.zero;
+  const span = model.span(sensor.x, sensor.y);
   const levelOf = (p: Vec3) => engine.levelOfPoint(p[0], p[1], p[2]);
+  const top = model.open ? 'wall top' : 'roof';
 
   const base: SensorGeom = {
     sensor,
@@ -338,7 +398,7 @@ export function sensorGeometry(
   };
 
   if (!span) {
-    base.error = 'This position is outside the tank. Move the sensor inside the outline.';
+    base.error = model.open ? 'This position is outside the storage. Move the sensor inside the inner wall faces.' : 'This position is outside the tank. Move the sensor inside the outline.';
     return base;
   }
   if (hasAnalog(sensor) && sensor.kind !== 'switch') {
@@ -358,7 +418,7 @@ export function sensorGeometry(
   base.floor = floor;
   base.floorLevel = levelOf(floor);
   base.roofLevel = levelOf(roof);
-  const tRoof = roofThickness(model, sensor.x, sensor.y, span.hi);
+  const tRoof = model.roofThickness(sensor.x, sensor.y, span.hi);
   base.roofOuter = planToTank(model, sensor.x, sensor.y, span.hi + tRoof);
 
   if (mount === 'top') {
@@ -368,7 +428,9 @@ export function sensorGeometry(
       if (!mg) {
         base.error = manholes.length
           ? 'Choose the manhole this sensor sits on.'
-          : 'There is no manhole on this tank. Add one, or put the sensor on the roof.';
+          : model.open
+            ? 'There is no manhole on this storage. Add one, or put the sensor on the wall top.'
+            : 'There is no manhole on this tank. Add one, or put the sensor on the roof.';
         return base;
       }
       if (!mg.ok) {
@@ -380,7 +442,7 @@ export function sensorGeometry(
       base.roofOuter = planToTank(model, sensor.x, sensor.y, mg.coverUp);
       const clear = manholeClearance(mg.manhole, sensor.x, sensor.y);
       if (clear < 0) {
-        warnings.push(`The sensor is outside the opening of ${mg.manhole.tag}: its beam would hit the roof plate. Move it over the opening.`);
+        warnings.push(`The sensor is outside the opening of ${mg.manhole.tag}: its beam would hit the ${model.open ? 'slab' : 'roof plate'}. Move it over the opening.`);
       } else {
         // Beam width where it leaves the neck (at the inside roof) against the clear opening.
         const half = (clamp(sensor.beamAngle, 0, 170) / 2) * (Math.PI / 180);
@@ -401,10 +463,10 @@ export function sensorGeometry(
     base.faceHeightUntilted = faceUp - zero;
     base.floorDist = faceUp - span.lo;
     if (faceUp < span.hi - 1e-6 && sensor.faceMode !== 'auto') {
-      warnings.push('The face is below the roof at this position: the sensor sits inside the tank.');
+      warnings.push(model.open ? 'The face is below the wall top: the sensor hangs inside the storage.' : 'The face is below the roof at this position: the sensor sits inside the tank.');
     }
     if (faceUp <= span.lo) {
-      base.error = 'The sensor face is below the tank floor.';
+      base.error = model.open ? 'The sensor face is below the floor.' : 'The sensor face is below the tank floor.';
       return base;
     }
     let near = sensor.deadBand;
@@ -423,31 +485,43 @@ export function sensorGeometry(
     }
     if (sensor.maxRange < base.floorDist) {
       warnings.push(
-        `Range ends ${Math.round(base.floorDist - sensor.maxRange)} mm above the floor: low levels cannot be measured.`,
+        model.open
+          ? `The floor under the sensor is ${Math.round(base.floorDist)} mm from its face, past its ${Math.round(sensor.maxRange)} mm range: the lowest ${Math.round(base.floorDist - sensor.maxRange)} mm cannot be measured. Move the sensor toward the shallowest part of the floor, or lower the bracket.`
+          : `Range ends ${Math.round(base.floorDist - sensor.maxRange)} mm above the floor: low levels cannot be measured.`,
       );
     }
-    if (base.validMax < engine.depth - 1e-6) {
+    if (model.open && base.manhole && faceUp - span.hi < sensor.deadBand - 1e-6) {
+      warnings.push(
+        `The face is only ${Math.round(faceUp - span.hi)} mm above the wall top, less than the ${Math.round(sensor.deadBand)} mm dead band: a full storage cannot be measured. Levels above ${Math.round(base.validMax)} mm fall in the dead band.`,
+      );
+    } else if (model.open && faceUp - span.hi < sensor.deadBand - 1e-6) {
+      warnings.push(
+        `The face is only ${Math.round(faceUp - span.hi)} mm above the wall top, less than the ${Math.round(sensor.deadBand)} mm dead band: a full storage cannot be measured. Raise the bracket to at least ${Math.round(sensor.deadBand)} mm.`,
+      );
+    } else if (base.validMax < engine.depth - 1e-6) {
       warnings.push(`Levels above ${Math.round(base.validMax)} mm fall in the dead band.`);
     }
     if (base.floorLevel > 1e-3 * model.size + 0.5) {
       warnings.push(
-        `The floor under the sensor is ${Math.round(base.floorLevel)} mm above level zero: lower levels are hidden from the beam.`,
+        model.open
+          ? `The floor under the sensor is ${Math.round(base.floorLevel)} mm above the deepest point: the beam cannot see levels below that, so they read as ${Math.round(base.floorLevel)} mm.`
+          : `The floor under the sensor is ${Math.round(base.floorLevel)} mm above level zero: lower levels are hidden from the beam.`,
       );
     }
     base.beamContactLevel = beamContact(sensor, model, base, engine);
     if (base.beamContactLevel !== null && base.beamContactLevel > base.validMin + 1) {
       warnings.push(
-        `The ${sensor.beamAngle}° beam touches the tank wall below level ${Math.round(base.beamContactLevel)} mm; echoes there may be unreliable.`,
+        `The ${sensor.beamAngle}° beam touches the ${model.open ? 'wall' : 'tank wall'} below level ${Math.round(base.beamContactLevel)} mm; echoes there may be unreliable.`,
       );
     }
   } else {
     const elevUp = sensor.kind === 'pressure' ? span.lo + sensor.elevation : zero + sensor.elevation;
     if (elevUp < span.lo - 1e-6) {
-      base.error = 'The sensing point is below the tank floor at this position.';
+      base.error = model.open ? 'The sensing point is below the floor at this position.' : 'The sensing point is below the tank floor at this position.';
       return base;
     }
     if (elevUp > span.hi + 1e-6) {
-      base.error = 'The sensing point is above the tank roof at this position.';
+      base.error = model.open ? `The sensing point is above the ${top}.` : 'The sensing point is above the tank roof at this position.';
       return base;
     }
     const face = planToTank(model, sensor.x, sensor.y, elevUp);
@@ -476,7 +550,7 @@ export function sensorGeometry(
 }
 
 /** Level below which the beam cone first touches a wall, or null if it stays clear. */
-function beamContact(sensor: SensorConfig, model: TankModel, g: SensorGeom, engine: VolumeEngine): number | null {
+function beamContact(sensor: SensorConfig, model: Hull, g: SensorGeom, engine: LevelEngine): number | null {
   const half = (clamp(sensor.beamAngle, 0, 170) / 2) * (Math.PI / 180);
   if (half <= 0) return null;
   const tanH = Math.tan(half);

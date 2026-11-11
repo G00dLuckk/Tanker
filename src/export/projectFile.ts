@@ -42,17 +42,35 @@ export function projectSummary(p: Project, d: Derived): Record<string, unknown> 
   const m = d.model;
   const n = endNames(p);
   const used = new Set<string>();
+  const shape =
+    d.kind === 'pit'
+      ? {
+          storage: {
+            planAreaM2: r3(d.pit.area / 1e6),
+            cornersMm: d.pit.outline.map((q) => [r1(q.x), r1(q.y)]),
+            wallTopAboveZeroMm: r1(d.pit.wallTop),
+            floor: d.pit.cfg.floor,
+            floorLowHighMm: [r1(d.pit.floorLow), r1(d.pit.floorHigh)],
+            sumps: d.pit.sumps.map((s) => ({ bottomMm: r1(s.bottom), rimMm: r1(s.rim), cornersMm: s.outline.map((q) => [r1(q.x), r1(q.y)]) })),
+            batterMmPerM: d.pit.cfg.batter,
+            heightsOnDrawingFrom: d.pit.cfg.heightRef,
+            drawingZeroAboveLevelZeroMm: r1(d.pit.refZ),
+          },
+        }
+      : {
+          insideMm: { width: r1(2 * m.base.A), depth: r1(2 * m.base.B), straightLength: r1(m.L), totalLength: r1(m.innerDims.length) },
+          outsideMm: { width: r1(m.outer.width), depth: r1(m.outer.depth), length: r1(m.outer.length) },
+          wallMm: { shell: m.t.shell, [n.start.toLowerCase()]: m.t.start, [n.end.toLowerCase()]: m.t.end },
+          [n.startLong]: { type: m.start.meta.label, insideDepthMm: r1(m.start.depth) },
+          [n.endLong]: { type: m.end.meta.label, insideDepthMm: r1(m.end.depth) },
+          tiltDeg: d.tilt,
+        };
   return {
     note: 'Read-only summary for people. Lengths in mm, volumes in litres, level zero = lowest inside point. Tanker Time ignores this block when it opens the file.',
     tank: bodyName(p, m),
     capacityL: r3(d.totalL),
     fullDepthMm: r1(d.depth),
-    insideMm: { width: r1(2 * m.base.A), depth: r1(2 * m.base.B), straightLength: r1(m.L), totalLength: r1(m.innerDims.length) },
-    outsideMm: { width: r1(m.outer.width), depth: r1(m.outer.depth), length: r1(m.outer.length) },
-    wallMm: { shell: m.t.shell, [n.start.toLowerCase()]: m.t.start, [n.end.toLowerCase()]: m.t.end },
-    [n.startLong]: { type: m.start.meta.label, insideDepthMm: r1(m.start.depth) },
-    [n.endLong]: { type: m.end.meta.label, insideDepthMm: r1(m.end.depth) },
-    tiltDeg: d.tilt,
+    ...shape,
     liquidDensity: p.liquid.density,
     problems: d.problems.length ? d.problems : undefined,
     manholes: d.manholes.length

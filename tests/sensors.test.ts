@@ -339,4 +339,50 @@ describe('manholes', () => {
     expect(opened.project.tank.manholes).toEqual(p.tank.manholes);
     expect(opened.project.sensors[0].faceMode).toBe('manhole');
   });
+
+  it('gives the neck its own size: plate, clear area and how high liquid can stand in it', () => {
+    const cfg = tank({ body: { diameter: 2000, length: 3000 } });
+    const round = onManhole(cfg, { diameter: 600, neck: 400, cover: 10 }).mg;
+    near(round.area, Math.PI * 300 * 300, 1e-6);
+    near(round.roofThickness, round.roofOuterUp - round.roofUp, 1e-9);
+    near(round.neckDepth, round.roofThickness + 400 - 10, 1e-9);
+    const rect = onManhole(cfg, { shape: 'rect', diameter: 800, length: 500, neck: 5, cover: 40 }).mg;
+    near(rect.area, 800 * 500, 1e-6);
+    // A cover thicker than the neck leaves no room for liquid above the roof plate's underside.
+    expect(rect.neckDepth).toBe(0);
+  });
+
+  it('a concrete storage with a slab on top: the manhole counts from the wall top', () => {
+    const p = PRESETS.find((x) => x.id === 'basin-sump')!.build();
+    const mh: ManholeConfig = { ...defaultManhole('MH-1'), shape: 'rect', diameter: 700, length: 700, x: 1000, y: 500, neck: 350, cover: 60 };
+    p.tank.manholes = [mh];
+    p.sensors = [{ ...defaultSensor('radar', 'LT-101'), x: 1000, y: 500, faceMode: 'manhole', manhole: mh.id, nozzle: 0, deadBand: 80, maxRange: 8000 }];
+    const d = derive(p);
+    expect(d.kind).toBe('pit');
+    if (d.kind !== 'pit') return;
+    const mg = d.manholes[0];
+    expect(mg.ok).toBe(true);
+    near(mg.roofLevel, d.pit.wallTop, 1e-9);
+    expect(mg.roofThickness).toBe(0);
+    near(mg.coverHeight, d.pit.wallTop + 350, 1e-9);
+    near(mg.neckDepth, 350 - 60, 1e-9);
+    const g = d.geoms[0];
+    expect(g.ok).toBe(true);
+    expect(g.manhole).toBe(mg);
+    near(g.faceLevel, d.pit.wallTop + 350, 1e-9);
+    // 350 mm above the wall top clears the 80 mm dead band: a full storage can be measured.
+    near(g.validMax, d.depth, 1e-9);
+    expect(g.warnings.some((w) => w.includes('dead band'))).toBe(false);
+    // Outside the walls, or with the cover below the wall top, it is refused in plain words.
+    p.tank.manholes = [{ ...mh, x: 99999 }];
+    expect(derive(p).manholes[0].error).toBe('The centre is outside the storage. Move the manhole inside the inner wall faces.');
+    p.tank.manholes = [{ ...mh, heightBy: 'zero', top: 100 }];
+    expect(derive(p).manholes[0].error).toBe('The top of the cover is below the wall top.');
+    p.tank.manholes = [];
+    expect(derive(p).geoms[0].error).toBe('There is no manhole on this storage. Add one, or put the sensor on the wall top.');
+    // The project file keeps the manhole of a storage.
+    p.tank.manholes = [mh];
+    const opened = parseProjectDoc(JSON.stringify({ project: p }));
+    expect(opened.project.tank.manholes).toEqual([mh]);
+  });
 });

@@ -1,6 +1,6 @@
 import { readSensor, toAdc, toSignal, hasAdc, hasAnalog, digitalFactor, type SensorGeom } from './sensors';
 import { MM3_TO_L } from './units';
-import type { VolumeEngine } from './volume';
+import type { LevelEngine } from './volume';
 
 export type TableMode = 'step' | 'rows' | 'compact';
 
@@ -64,7 +64,7 @@ export function simplify(xs: ArrayLike<number>, ys: ArrayLike<number>, tol: numb
 }
 
 /** Levels for a table over [lo, hi]. */
-export function tableLevels(engine: VolumeEngine, lo: number, hi: number, opt: TableOptions): number[] {
+export function tableLevels(engine: LevelEngine, lo: number, hi: number, opt: TableOptions): number[] {
   if (!(hi > lo)) return [lo];
   if (opt.mode === 'rows') {
     const n = Math.max(1, Math.min(10000, Math.round(opt.rows)));
@@ -103,19 +103,12 @@ export function tableLevels(engine: VolumeEngine, lo: number, hi: number, opt: T
   return out;
 }
 
-/** Levels where the tank profile changes shape (junctions of shell and heads). */
-export function breakLevels(engine: VolumeEngine): number[] {
-  const m = engine.model;
-  const r: [number, number] = [0, 0];
-  const out: number[] = [];
-  for (const a of m.breaks) {
-    engine.heightRange(a, r);
-    out.push(r[0] - engine.hMin, r[1] - engine.hMin);
-  }
-  return out.filter((L) => L > 0 && L < engine.depth);
+/** Levels where the shape changes (junctions of shell and heads, floor breaks of a storage). */
+export function breakLevels(engine: LevelEngine): number[] {
+  return engine.breakLevels();
 }
 
-export function strapTable(engine: VolumeEngine, opt: TableOptions): StrapRow[] {
+export function strapTable(engine: LevelEngine, opt: TableOptions): StrapRow[] {
   return tableLevels(engine, 0, engine.depth, opt).map((level) => ({ level, litres: engine.volume(level) * MM3_TO_L }));
 }
 
@@ -126,7 +119,7 @@ export function strapTable(engine: VolumeEngine, opt: TableOptions): StrapRow[] 
  */
 export function sensorTable(
   g: SensorGeom,
-  engine: VolumeEngine,
+  engine: LevelEngine,
   density: number,
   opt: TableOptions,
   readAt?: (level: number) => number,

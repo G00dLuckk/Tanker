@@ -2,7 +2,7 @@ import type { TableMode } from '../core/calibration';
 import type { Project, SimState, SiteDevice, ViewState } from '../core/types';
 import type { LengthUnit, VolumeUnit } from '../core/units';
 
-export type ExportTab = 'config' | 'payload' | 'table';
+export type ExportTab = 'config' | 'payload' | 'table' | 'details';
 
 export interface ExportPrefs {
   tab: ExportTab;
@@ -18,6 +18,8 @@ export interface ExportPrefs {
   volumeUnit: VolumeUnit | 'auto';
   /** Variable type ids by unit (mm, %, L, kPa…); 0 or missing = not set. */
   csVarIds: Record<string, number>;
+  /** Sensor family of the device model: LoRaWAN (DevEUI) or TCP (IMEI); auto = from the devices listed. */
+  csFamily: 'auto' | 'lorawan' | 'tcp';
 }
 
 export interface AppState {

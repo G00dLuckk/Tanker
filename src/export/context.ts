@@ -13,6 +13,11 @@ export function endNames(p: Project): { start: string; end: string; startLong: s
 const POLY_NAMES: Record<number, string> = { 6: 'hexagonal', 8: 'octagonal', 10: 'decagonal', 12: 'dodecagonal' };
 
 export function bodyName(p: Project, m: TankModel): string {
+  if (p.tank.kind === 'pit' && p.tank.pit) {
+    const f = p.tank.pit.floor;
+    const floor = f.type === 'plane' ? 'floor sloping one way' : f.type === 'vertices' ? 'floor given at the corners' : 'flat floor';
+    return `Concrete storage, open at the top, ${p.tank.pit.outline.length}-corner plan, ${floor}${p.tank.pit.sumps.length ? `, ${p.tank.pit.sumps.length} sump${p.tank.pit.sumps.length === 1 ? '' : 's'}` : ''}`;
+  }
   const o = p.tank.orientation === 'vertical' ? 'Vertical' : 'Horizontal';
   const shape = m.profile ? ' (stepped / profiled shell)' : m.endScale !== 1 ? ' (tapered)' : '';
   switch (m.bodyType) {

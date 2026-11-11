@@ -87,9 +87,13 @@ export class GuideDialog {
         text: [
           'Start from the Tank library if a tank there looks like yours. Then choose standing (vertical) or lying (horizontal), the body shape, and the shape of each end.',
           vert ? 'For a standing tank the ends are the bottom (footer) and the top (head).' : 'For a lying tank the ends are the left and right ends.',
+          'An open concrete storage (asphalt pit, basin) is drawn in plan instead: choose "Concrete storage", type the corners of the inside of the walls, the wall height and how the floor slopes, and add a sump if there is one.',
         ],
         checks: () => [
-          { kind: 'ok', text: `Now: ${bodyName(p, d.model).toLowerCase()}, ends: ${d.model.start.meta.label.toLowerCase()} and ${d.model.end.meta.label.toLowerCase()}.` },
+          {
+            kind: 'ok',
+            text: d.kind === 'pit' ? `Now: ${bodyName(p, d.model).toLowerCase()}, plan area ${plain(d.pit.area / 1e6, 2)} m².` : `Now: ${bodyName(p, d.model).toLowerCase()}, ends: ${d.model.start.meta.label.toLowerCase()} and ${d.model.end.meta.label.toLowerCase()}.`,
+          },
         ],
         action: { label: 'Open Tank shape', run: () => this.go('shape') },
       },
@@ -112,14 +116,17 @@ export class GuideDialog {
           'Wall thickness makes the inside smaller and decides where a top sensor sits. Tilt matters for long horizontal tanks. Density matters for pressure sensors.',
         ],
         checks: () => [
-          { kind: 'ok', text: `Shell wall ${fmtLen(d.model.t.shell, lu)}, tilt ${plain(d.tilt, 2)}°, density ${plain(p.liquid.density, 1)} kg/m³.` },
+          {
+            kind: 'ok',
+            text: d.kind === 'pit' ? `Wall top ${fmtLen(d.pit.wallTop, lu)} above the deepest point, density ${plain(p.liquid.density, 1)} kg/m³.` : `Shell wall ${fmtLen(d.model.t.shell, lu)}, tilt ${plain(d.tilt, 2)}°, density ${plain(p.liquid.density, 1)} kg/m³.`,
+          },
         ],
         action: { label: 'Open Wall thickness', run: () => this.go('wall') },
       },
       {
         title: 'Place the sensors',
         text: [
-          'Add a Top sensor (ultrasonic, radar, laser) or a Bottom sensor (pressure). Drag it in the top view to the real nozzle position, and set the nozzle height, dead band and range from its data sheet. If the sensor sits on the manhole (hole door) cover, add a Manhole, set its neck height, and choose "On a manhole" for the sensor face height.',
+          'Add a Top sensor (ultrasonic, radar, laser) or a Bottom sensor (pressure). Drag it in the top view to the real nozzle position, and set the nozzle height, dead band and range from its data sheet. If the sensor sits on the manhole (hole door) cover, add a Manhole with its own opening size, set its neck height, and choose "On a manhole" for the sensor face height. This also works on a concrete storage with a slab on top; the Cloud Studio script then holds the sizes of the manhole too.',
           'Set the output the same as your wiring: digital value, 4–20 mA or voltage, and the ADC if your board digitises it.',
         ],
         checks: () => {
